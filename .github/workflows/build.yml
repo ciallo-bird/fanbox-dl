@@ -70,6 +70,16 @@ jobs:
       - name: Test before publishing
         run: go test ./...
 
+      - name: Lint before publishing
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15.0
+
+      - name: Check vulnerabilities before publishing
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:

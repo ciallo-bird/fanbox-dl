@@ -25,12 +25,12 @@ const (
 
 // HTMLGenerator generates HTML pages from FANBOX posts
 type HTMLGenerator struct {
-	Enable                   bool
-	DirByPost                bool
-	DirByPlan                bool
-	RemoveUnprintableChars   bool
-	SaveDir                  string
-	Language                 Language
+	Enable                 bool
+	DirByPost              bool
+	DirByPlan              bool
+	RemoveUnprintableChars bool
+	SaveDir                string
+	Language               Language
 }
 
 // i18nTexts holds translations for different languages
@@ -140,12 +140,12 @@ func (hg *HTMLGenerator) GenerateHTML(post Post, creatorName string) string {
 	var sb strings.Builder
 
 	// HTML header with language attribute
-	sb.WriteString(fmt.Sprintf(`<!DOCTYPE html>
-<html lang="%s">`, hg.Language))
+	fmt.Fprintf(&sb, `<!DOCTYPE html>
+<html lang="%s">`, hg.Language)
 	sb.WriteString("\n<head>\n")
 	sb.WriteString(`<meta charset="UTF-8">`)
 	sb.WriteString("\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">")
-	sb.WriteString(fmt.Sprintf("\n<title>%s - %s</title>", html.EscapeString(creatorName), html.EscapeString(post.Title)))
+	fmt.Fprintf(&sb, "\n<title>%s - %s</title>", html.EscapeString(creatorName), html.EscapeString(post.Title))
 	sb.WriteString("\n<style>\n")
 	sb.WriteString(`
 body {
@@ -212,18 +212,18 @@ h2 {
 	sb.WriteString("<div class=\"post-container\">\n")
 
 	// Title
-	sb.WriteString(fmt.Sprintf("<h1>%s</h1>\n", html.EscapeString(post.Title)))
+	fmt.Fprintf(&sb, "<h1>%s</h1>\n", html.EscapeString(post.Title))
 
 	// Meta information
 	publishedTime, _ := time.Parse(time.RFC3339, post.PublishedDateTime)
 	fmt.Fprintln(&sb, "<div class=\"post-meta\">")
-	sb.WriteString(fmt.Sprintf("%s: %s<br>\n", texts.PublishedTime, publishedTime.Format("2006/01/02 15:04")))
-	sb.WriteString(fmt.Sprintf("%s: %s<br>\n", texts.Author, html.EscapeString(creatorName)))
-	sb.WriteString(fmt.Sprintf("%s: %s<br>\n", texts.CreatorID, post.CreatorID))
+	fmt.Fprintf(&sb, "%s: %s<br>\n", texts.PublishedTime, publishedTime.Format("2006/01/02 15:04"))
+	fmt.Fprintf(&sb, "%s: %s<br>\n", texts.Author, html.EscapeString(creatorName))
+	fmt.Fprintf(&sb, "%s: %s<br>\n", texts.CreatorID, post.CreatorID)
 	if post.FeeRequired > 0 {
-		sb.WriteString(fmt.Sprintf("%s: %d円<br>\n", texts.Fee, post.FeeRequired))
+		fmt.Fprintf(&sb, "%s: %d円<br>\n", texts.Fee, post.FeeRequired)
 	}
-	sb.WriteString(fmt.Sprintf("%s: %s\n", texts.PostID, post.ID))
+	fmt.Fprintf(&sb, "%s: %s\n", texts.PostID, post.ID)
 	sb.WriteString("</div>\n")
 
 	// Content
@@ -236,7 +236,7 @@ h2 {
 	// Add plain text if available
 	if post.Body != nil && post.Body.Text != "" {
 		sb.WriteString("<div class=\"text-block\">\n")
-		sb.WriteString(fmt.Sprintf("<p>%s</p>\n", html.EscapeString(post.Body.Text)))
+		fmt.Fprintf(&sb, "<p>%s</p>\n", html.EscapeString(post.Body.Text))
 		sb.WriteString("</div>\n")
 	}
 
@@ -245,8 +245,8 @@ h2 {
 
 	// Footer
 	sb.WriteString(`<div class="footer">`)
-	sb.WriteString(fmt.Sprintf("<p>%s: <a href=\"https://www.fanbox.cc/@%s/posts/%s\" target=\"_blank\">https://www.fanbox.cc/@%s/posts/%s</a></p>\n",
-		texts.Source, post.CreatorID, post.ID, post.CreatorID, post.ID))
+	fmt.Fprintf(&sb, "<p>%s: <a href=\"https://www.fanbox.cc/@%s/posts/%s\" target=\"_blank\">https://www.fanbox.cc/@%s/posts/%s</a></p>\n",
+		texts.Source, post.CreatorID, post.ID, post.CreatorID, post.ID)
 	sb.WriteString("</div>\n")
 
 	sb.WriteString("</body>\n</html>")

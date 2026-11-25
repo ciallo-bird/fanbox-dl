@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bogdanfinn/fhttp/http2"
 	"github.com/hareku/fanbox-dl/internal/ctxval"
-	"golang.org/x/net/http2"
 )
 
 // Checker validates downloaded content
@@ -442,7 +442,7 @@ func (c *Checker) downloadWithRetry(ctx context.Context, post Post, order int, d
 		}
 
 		// Retry on HTTP/2 errors
-		var goAwayErr *http2.GoAwayError
+		var goAwayErr http2.GoAwayError
 		if errors.As(err, &goAwayErr) {
 			return true
 		}

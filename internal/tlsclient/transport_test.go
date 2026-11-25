@@ -46,7 +46,7 @@ func TestTransportPreservesOuterCookiesRedirectsAndGzip(t *testing.T) {
 	client := &http.Client{Transport: transport, Jar: jar, Timeout: 5 * time.Second}
 	resp, err := client.Get(server.URL)
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)

@@ -333,6 +333,13 @@ This is useful for:
 - Auditing download completeness
 
 
+### Changes in v0.30.1
+
+- Requires Go 1.27.4 and updates Brotli, compression, networking, OpenTelemetry and gRPC dependencies to address the vulnerabilities reported by CI.
+- Requires tests, lint and vulnerability scanning to pass before publishing release binaries.
+- Matches GOAWAY errors from the actual TLS transport so interrupted downloads can resume.
+- Retains the crawling/session fixes below; use this version instead of the superseded v0.30.0 prerelease.
+
 ### Changes in v0.30.0
 
 - Integrates upstream through `hareku/fanbox-dl@7d40c1f`, retaining this fork's export, filtering, resumable-download and external-host features.
@@ -345,7 +352,7 @@ This is useful for:
 
 ### Building from Source
 
-Go 1.27 or newer is required.
+Go 1.27.4 or newer is required.
 
 ```bash
 # Build for current platform

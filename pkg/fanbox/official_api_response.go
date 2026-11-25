@@ -204,7 +204,7 @@ func (pb *PostBody) ExtractText() string {
 				if file.Name != "" {
 					fileLabel = file.Name
 				}
-				textContent.WriteString(fmt.Sprintf("[File: %s.%s]\n", fileLabel, file.Extension))
+				fmt.Fprintf(&textContent, "[File: %s.%s]\n", fileLabel, file.Extension)
 			}
 		}
 
@@ -212,7 +212,7 @@ func (pb *PostBody) ExtractText() string {
 		if pb.Images != nil {
 			textContent.WriteString("\n\n--- Images ---\n")
 			for _, img := range *pb.Images {
-				textContent.WriteString(fmt.Sprintf("[Image: %s.%s]\n", img.ID, img.Extension))
+				fmt.Fprintf(&textContent, "[Image: %s.%s]\n", img.ID, img.Extension)
 			}
 		}
 	}

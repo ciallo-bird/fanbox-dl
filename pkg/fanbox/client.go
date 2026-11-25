@@ -14,8 +14,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/bogdanfinn/fhttp/http2"
 	"github.com/hareku/fanbox-dl/internal/ctxval"
-	"golang.org/x/net/http2"
 )
 
 // Client is struct for Client.
@@ -596,7 +596,7 @@ func (c *Client) downloadWithRetry(ctx context.Context, post Post, order int, d 
 			return true
 		}
 
-		var goAwayErr *http2.GoAwayError
+		var goAwayErr http2.GoAwayError
 		return errors.As(err, &goAwayErr)
 	}
 
