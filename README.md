@@ -12,12 +12,14 @@ Caution: `fanbox-dl` is command-line-program, so it doesn't provide graphical us
 
 ## Installation
 
-The latest binary can be downloaded [here](https://github.com/hareku/fanbox-dl/releases/latest).
+The latest binary for this merged fork can be downloaded [here](https://github.com/ciallo-bird/fanbox-dl/releases/latest).
 
-- Windows (64bit): `fanbox-dl_x.x.x_Windows_x86_64.exe`
-- Windows (32bit): `fanbox-dl_x.x.x_Windows_i386.exe`
-- Mac: `fanbox-dl_x.x.x_Darwin_x86_64`
-- Mac (M1 CPU): `fanbox-dl_x.x.x_Darwin_arm64`
+- Windows (64-bit): `fanbox-dl_Windows_x86_64.zip`
+- macOS (Intel): `fanbox-dl_Darwin_x86_64.tar.gz`
+- macOS (Apple Silicon): `fanbox-dl_Darwin_arm64.tar.gz`
+- Linux: `fanbox-dl_Linux_x86_64.tar.gz` or `fanbox-dl_Linux_arm64.tar.gz`
+
+Extract the archive before running the binary. Each release includes `checksums.txt` for SHA-256 verification.
 
 ## Usage
 
@@ -31,7 +33,7 @@ The latest binary can be downloaded [here](https://github.com/hareku/fanbox-dl/r
 | Command | Description | Usage | Default |
 | --- | --- | --- | --- |
 | sessid | Requires FANBOXSESSID which is stored in browser Cookies for login state. <br>When not provided, refers FANBOXSESSID environment value. <br>If unavailable, only free posts are downloaded when accompanied by a `creator` flag. | `--sessid xxxxx` | `NULL` |
-| cookie | Cookie string to use for requests. <br>When not provided, refers to `sessid` flag. | `--cookie "name=value; name2=value2"` | `NULL` |
+| cookie | Full Cookie string for the FANBOX API. Overrides `sessid`; `FANBOX_COOKIE` is used when neither a flag nor `FANBOXSESSID` is set. | `--cookie "name=value; name2=value2"` | `NULL` |
 | creator | Comma separated Pixiv creator IDs to download contents. <br>Overrides `supporting` and `following` flags. <br>`https://www.fanbox.cc/@`**example**. <br>Only bold text needed from URL. | `--creator user1`, `--creator user1,user2` | `NULL` |
 | ignore-creator | Comma separated Pixiv creator IDs to ignore to download contents. | `--ignore-creator user1,user2` | `NULL` |
 | supporting | When disabled, will not download content from creators you're supporting. | `--supporting=false` | `true` |
@@ -46,9 +48,9 @@ The latest binary can be downloaded [here](https://github.com/hareku/fanbox-dl/r
 | dry-run | Will skip downloading all content from creators. | `--dry-run` | `false` |
 | verbose | Gives more detailed information about commands being executed by application. <br>Useful for debugging errors. | `--verbose` | `false` |
 | save-dir | Root directory to save content. <br>Put directory in double quotes `"` if it contains spaces. <br>Supports relative and absolute directories. | `--save-dir ./content` | `./images` |
-| user-agent | User agent to use for requests. | `--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"` | `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3` |
+| user-agent | User agent for requests. Keep it aligned with the Chrome 146 PSK TLS profile; arbitrary overrides can trigger anti-bot checks. | `--user-agent "Mozilla/5.0 ... Chrome/146.0.0.0 Safari/537.36"` | Chrome 146 |
 | remove-unprintable-chars | Removes unprintable characters from file name. In some environments, unprintable characters are not allowed in file names. | `--remove-unprintable-chars` | `false` |
-| rate-limit | Rate limit for API requests in requests per second. Set to 0 for no limit. | `--rate-limit 2.0` | `0` |
+| rate-limit | Maximum FANBOX request rate, including retries and media requests. Set to 0 to explicitly disable pacing. | `--rate-limit 0.5` | `0.5` |
 | save-json | Save original API JSON responses as `post.json` files in each post directory. | `--save-json` | `false` |
 | start-date | Only download posts published on or after this date. Format: YYYY-MM-DD | `--start-date 2023-01-01` | `NULL` |
 | end-date | Only download posts published on or before this date. Format: YYYY-MM-DD | `--end-date 2023-12-31` | `NULL` |
@@ -57,9 +59,9 @@ The latest binary can be downloaded [here](https://github.com/hareku/fanbox-dl/r
 | download-gigafiles | Automatically download files from gigafile.nu links in post content. | `--download-gigafiles` | `false` |
 | download-drive | Automatically download files from Google Drive links in post content. | `--download-drive` | `false` |
 | download-threads | Number of concurrent download workers for assets and external links. | `--download-threads 4` | `1` |
-| timeout | HTTP timeout for downloads and API requests (e.g., 30s, 5m). | `--timeout 60s` | `0` (no timeout) |
+| timeout | HTTP timeout for downloads and API requests (e.g., 30s, 5m). | `--timeout 60s` | `2m` |
 | use-state-manager | Use state manager to track downloaded posts (creates LastSavePostId.json). | `--use-state-manager` | `false` |
-| check | Check downloaded content for completeness without downloading. Validates that all images, files, text, JSON, and HTML files exist. | `--check` | `false` |
+| check | Check downloaded content and repair missing images, files, text, JSON and HTML. Waits for repair work before exiting. | `--check` | `false` |
 
 ### Example
 
@@ -72,6 +74,18 @@ And you can see media in the relevant directory. `./content/creatornamehere/xxxx
 fanbox-dl needs your account FANBOXSESSID to download supported content, which has your login state stored in a browser Cookie.
 
 For example, if you are using Google Chrome, you can get it by following to steps in https://developers.google.com/web/tools/chrome-devtools/storage/cookies.
+
+### Session safety
+
+Use the same network/IP as your logged-in browser and avoid simultaneous crawlers using the same session. Leave the default `--rate-limit 0.5` and `--download-threads 1` in place unless you understand the account-risk tradeoff. Do not repeatedly retry after a rejection or switch proxies to force access.
+
+Imported login cookies are scoped to HTTPS `api.fanbox.cc`, not media CDNs or external download hosts. Server-issued Cloudflare cookies and session rotations are retained in memory, including across retries; the original cookie string is not replayed over newer values. Cookie state is not written back to your browser or stored on disk.
+
+HTTP 401/403, API login redirects, `authentication_required` responses, and deletion/expiry of `FANBOXSESSID` stop subsequent FANBOX requests. `--skip-on-error` does not bypass this protection. Check the browser login and network before starting a new run. Empty paid-plan lists are not treated as proof that a session is invalid.
+
+Prefer the `FANBOXSESSID` environment variable over putting a session ID in command-line arguments or shell history. `FANBOX_COOKIE` accepts a full cookie string; precedence is `--cookie`, `--sessid`, `FANBOXSESSID`, then `FANBOX_COOKIE`. Never share cookies in logs or bug reports.
+
+These safeguards reduce known client-side risks; they cannot guarantee that FANBOX will never revoke a session. Offline tests and a local HTTPS transport test do not replace authenticated live-account verification.
 
 ### Advanced Features
 
@@ -160,11 +174,11 @@ This creates and uses:
 - `LastSavePostId.json`: Stores the last downloaded post ID for each creator
 - `.state` files: Track individual download progress for resume capability
 - Automatically stops when reaching already downloaded posts
-- Updates the last post ID after each successful download
+- Advances the last post ID only after a successful, unfiltered, non-dry-run crawl without `--skip-on-error`
 
 #### Checking Download Completeness
 
-Verify that all content has been downloaded successfully without re-downloading:
+Verify downloaded content and repair missing files without re-downloading existing files:
 
 ```bash
 fanbox-dl --cookie "YOUR_COOKIE" --check
@@ -179,6 +193,7 @@ The check mode will:
   - HTML files (if `--save-html` was enabled)
 - Report any missing files with detailed information
 - Display a summary of complete vs incomplete posts
+- Repair missing content with the configured worker limit and wait for active downloads before exiting
 
 **Example output:**
 ```
@@ -256,13 +271,13 @@ find ./images -name "*.part" -type f -delete
 
 #### Rate Limiting
 
-Control the rate of API requests to avoid hitting rate limits or being blocked. Use the `--rate-limit` flag:
+FANBOX requests are paced at 0.5 requests per second by default. This includes retries and media request headers, but not external Gigafile or Google Drive traffic. To set an explicit rate:
 
 ```bash
-fanbox-dl --cookie "YOUR_COOKIE" --rate-limit 1.5
+fanbox-dl --cookie "YOUR_COOKIE" --rate-limit 0.5
 ```
 
-This limits API requests to 1.5 requests per second. Set to `0` for no limit.
+This allows one FANBOX request every two seconds. `--rate-limit 0` explicitly disables pacing and increases the risk of rate limits or account/session rejection.
 
 #### Saving Original API JSON
 
@@ -287,7 +302,7 @@ fanbox-dl \
   --download-gigafiles \
   --download-drive \
   --use-state-manager \
-  --rate-limit 2.0 \
+  --rate-limit 0.5 \
   --save-json \
   --verbose \
   #--check
@@ -317,10 +332,20 @@ This is useful for:
 - Checking if any files are missing
 - Auditing download completeness
 
-v ./pkg/fanbox -run TestDriveDownloader
-```
+
+### Changes in v0.30.0
+
+- Integrates upstream through `hareku/fanbox-dl@7d40c1f`, retaining this fork's export, filtering, resumable-download and external-host features.
+- Supports both legacy and wrapped FANBOX API responses; skips restricted or empty post bodies safely.
+- Aligns TLS/User-Agent with Chrome 146 and adds scoped, rotating cookies and session-stop protection.
+- Fixes premature checkpoint/date pagination exits, old pinned-post handling, and duplicate first-page fetching. Dry runs, filtered runs and failures do not advance checkpoints.
+- Fixes recursive-lock deadlocks when saving post checkpoints and supporting-creator lists.
+- Bounds `--check` repairs and waits for them before exit; authentication failures no longer trigger chunk/HEAD fallback retries.
+- Publishes stable version-tagged releases with checksums instead of overwriting a `dev` snapshot.
 
 ### Building from Source
+
+Go 1.27 or newer is required.
 
 ```bash
 # Build for current platform

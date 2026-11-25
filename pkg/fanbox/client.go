@@ -96,6 +96,9 @@ func (c *Client) Run(ctx context.Context, creatorID string) error {
 		remainingIncomplete[id] = struct{}{}
 	}
 
+	var newestPostID int64
+	reachedLastPost := false
+
 	for i, page := range pagination.Pages {
 		content := ListCreatorResponse{}
 		err := c.OfficialAPIClient.RequestAndUnwrapJSON(ctx, http.MethodGet, page, &content)
@@ -106,11 +109,20 @@ func (c *Client) Run(ctx context.Context, creatorID string) error {
 			"page", i+1,
 			"posts", len(content.Body),
 		)
+		if i == 0 && c.StateManager != nil {
+			for _, post := range content.Body {
+				if !post.IsPinned && c.isWithinDateRange(post.PublishedDateTime) {
+					if id, err := strconv.ParseInt(post.ID, 10, 64); err == nil && id > newestPostID {
+						newestPostID = id
+					}
+				}
+			}
+		}
 
 		// Filter posts based on last post ID, but keep incomplete ones
 		if shouldCheckLastPost {
 			filteredPosts := make([]Post, 0, len(content.Body))
-			reachedLastPost := false
+			reachedLastPost = false
 			for _, post := range content.Body {
 				postID, err := strconv.ParseInt(post.ID, 10, 64)
 				if err != nil {
@@ -124,6 +136,9 @@ func (c *Client) Run(ctx context.Context, creatorID string) error {
 						delete(remainingIncomplete, postID)
 						continue
 					}
+					if post.IsPinned {
+						continue
+					}
 					reachedLastPost = true
 					if len(remainingIncomplete) == 0 {
 						break
@@ -134,11 +149,6 @@ func (c *Client) Run(ctx context.Context, creatorID string) error {
 				filteredPosts = append(filteredPosts, post)
 			}
 			content.Body = filteredPosts
-
-			if reachedLastPost && len(remainingIncomplete) == 0 {
-				slog.InfoContext(ctx, "Reached last saved post, stopping")
-				break
-			}
 		}
 
 		if err := c.handlePage(ctx, &content); err != nil {
@@ -149,40 +159,35 @@ func (c *Client) Run(ctx context.Context, creatorID string) error {
 			return fmt.Errorf("handle page: %w", err)
 		}
 
-		// Check if we can stop fetching more pages based on dates
-		if c.EndDate != nil && len(content.Body) > 0 {
-			// If the last post on this page is older than the start date,
-			// we don't need to check further pages
-			oldestPostTime, err := time.Parse(time.RFC3339, content.Body[len(content.Body)-1].PublishedDateTime)
-			if err == nil && oldestPostTime.Before(*c.EndDate) {
-				slog.InfoContext(ctx, "Reached posts older than end date, stopping pagination")
+		if reachedLastPost && len(remainingIncomplete) == 0 {
+			slog.InfoContext(ctx, "Reached last saved post, stopping")
+			break
+		}
+		// Pages are newest first; an end-date excludes newer posts, not older pages.
+		if c.StartDate != nil && len(content.Body) > 0 {
+			pastStart := true
+			sawUnpinned := false
+			for _, post := range content.Body {
+				if post.IsPinned {
+					continue
+				}
+				sawUnpinned = true
+				published, err := time.Parse(time.RFC3339, post.PublishedDateTime)
+				if err != nil || !published.Before(*c.StartDate) {
+					pastStart = false
+					break
+				}
+			}
+			if pastStart && sawUnpinned {
 				break
 			}
 		}
 	}
 
-	// Update last post ID if state manager is enabled
-	if c.StateManager != nil && len(pagination.Pages) > 0 {
-		// Get the first post from the first page to update as last downloaded
-		firstPage := pagination.Pages[0]
-		firstPageContent := ListCreatorResponse{}
-		if err := c.OfficialAPIClient.RequestAndUnwrapJSON(ctx, http.MethodGet, firstPage, &firstPageContent); err == nil {
-			if len(firstPageContent.Body) > 0 {
-				// Find the first non-pinned post
-				for _, post := range firstPageContent.Body {
-					if !post.IsPinned {
-						postID, err := strconv.ParseInt(post.ID, 10, 64)
-						if err == nil {
-							if err := c.StateManager.UpdateLastPostID(creatorID, postID); err != nil {
-								slog.Warn("Failed to update last post ID", "error", err)
-							} else {
-								slog.Info("Updated last post ID", "creator_id", creatorID, "post_id", postID)
-							}
-							break
-						}
-					}
-				}
-			}
+	// Reuse the first page; never advance the checkpoint on a failed download.
+	if c.StateManager != nil && newestPostID > lastPostID && !c.DryRun && !c.SkipOnError && c.StartDate == nil && c.EndDate == nil {
+		if err := c.StateManager.UpdateLastPostID(creatorID, newestPostID); err != nil {
+			return fmt.Errorf("update last post ID: %w", err)
 		}
 	}
 
@@ -237,6 +242,10 @@ func (c *Client) handlePost(ctx context.Context, item Post) error {
 		return fmt.Errorf("get post: %w", err)
 	}
 	post := postResp.Body
+	if post.IsRestricted || post.Body == nil {
+		slog.DebugContext(ctx, "Skipping restricted or empty post")
+		return nil
+	}
 
 	// Handle saving JSON if enabled
 	if err := c.handlePostJSON(ctx, post); err != nil {
@@ -296,7 +305,7 @@ func (c *Client) handlePost(ctx context.Context, item Post) error {
 			return nil
 		})
 	}
-	if err := c.runTasks(ctx, tasks); err != nil {
+	if err := runDownloadTasks(ctx, tasks, c.DownloadWorkers); err != nil {
 		return err
 	}
 
@@ -469,7 +478,7 @@ func (c *Client) handleExternalLinks(ctx context.Context, post Post, htmlContent
 					return nil
 				})
 			}
-			_ = c.runTasks(ctx, tasks)
+			_ = runDownloadTasks(ctx, tasks, c.DownloadWorkers)
 		}
 	}
 
@@ -496,7 +505,7 @@ func (c *Client) handleExternalLinks(ctx context.Context, post Post, htmlContent
 					return nil
 				})
 			}
-			_ = c.runTasks(ctx, tasks)
+			_ = runDownloadTasks(ctx, tasks, c.DownloadWorkers)
 		}
 	}
 }
@@ -566,7 +575,7 @@ func (c *Client) handleAsset(ctx context.Context, post Post, order int, d Downlo
 
 	slog.InfoContext(ctx, "Downloading")
 	if err := c.downloadWithRetry(ctx, post, order, d); err != nil {
-		if c.SkipOnError {
+		if c.SkipOnError && !errors.Is(err, ErrInvalidSession) && !errors.Is(err, ErrStatusForbidden) {
 			slog.ErrorContext(ctx, "Skip downloading due to error", "error", err)
 			return nil
 		}
@@ -592,8 +601,10 @@ func (c *Client) downloadWithRetry(ctx context.Context, post Post, order int, d 
 	}
 
 	waitDur := time.Second
+	var lastErr error
 	for retry := 0; retry < 10; retry++ {
 		if err := c.download(ctx, post, order, d); err != nil {
+			lastErr = err
 			if !shouldRetry(err) {
 				return fmt.Errorf("download error: %w", err)
 			}
@@ -606,9 +617,9 @@ func (c *Client) downloadWithRetry(ctx context.Context, post Post, order int, d 
 			}
 			continue
 		}
-		break
+		return nil
 	}
-	return nil
+	return fmt.Errorf("download failed after 10 attempts: %w", lastErr)
 }
 
 var ErrStatusForbidden = errors.New("status code 403")
@@ -700,70 +711,4 @@ func (c *Client) download(ctx context.Context, post Post, order int, d Downloada
 	}
 
 	return nil
-}
-
-func (c *Client) runTasks(ctx context.Context, tasks []func() error) error {
-	if len(tasks) == 0 {
-		return nil
-	}
-	workers := c.DownloadWorkers
-	if workers <= 0 {
-		workers = 1
-	}
-	if workers == 1 {
-		for _, task := range tasks {
-			// Check context cancellation before each task
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-			if err := task(); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	sem := make(chan struct{}, workers)
-	errCh := make(chan error, len(tasks))
-	doneCh := make(chan struct{})
-
-	// Wait group equivalent
-	go func() {
-		defer close(doneCh)
-		for _, task := range tasks {
-			select {
-			case <-ctx.Done():
-				// Context cancelled, push context error to signal early exit
-				errCh <- ctx.Err()
-				return
-			case sem <- struct{}{}:
-			}
-
-			task := task
-			go func() {
-				defer func() { <-sem }()
-				errCh <- task()
-			}()
-		}
-	}()
-
-	var firstErr error
-	completed := 0
-	for completed < len(tasks) {
-		select {
-		case <-ctx.Done():
-			// Context cancelled
-			return ctx.Err()
-		case <-doneCh:
-			// All tasks have been dispatched
-		case err := <-errCh:
-			completed++
-			if err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
 }

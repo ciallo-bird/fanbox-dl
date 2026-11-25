@@ -86,6 +86,11 @@ func (sm *StateManager) LoadLastPostIDs() error {
 func (sm *StateManager) SaveLastPostIDs() error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	return sm.saveLastPostIDsLocked()
+}
+
+// saveLastPostIDsLocked requires sm.mu to be held by the caller.
+func (sm *StateManager) saveLastPostIDsLocked() error {
 
 	path := filepath.Join(sm.stateDir, "LastSavePostId.json")
 
@@ -116,7 +121,7 @@ func (sm *StateManager) UpdateLastPostID(creatorID string, postID int64) error {
 	defer sm.mu.Unlock()
 
 	sm.lastPostIDs[creatorID] = postID
-	return sm.SaveLastPostIDs()
+	return sm.saveLastPostIDsLocked()
 }
 
 // ShouldSkipPost checks if a post should be skipped based on last saved ID
@@ -178,6 +183,11 @@ func (sm *StateManager) LoadSupportingList() error {
 func (sm *StateManager) SaveSupportingList() error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	return sm.saveSupportingListLocked()
+}
+
+// saveSupportingListLocked requires sm.mu to be held by the caller.
+func (sm *StateManager) saveSupportingListLocked() error {
 
 	path := filepath.Join(sm.stateDir, "SupportList.json")
 
@@ -206,7 +216,7 @@ func (sm *StateManager) AddSupportingCreator(accountID string, creator Supportin
 	}
 
 	sm.supportingList[accountID] = append(sm.supportingList[accountID], creator)
-	return sm.SaveSupportingList()
+	return sm.saveSupportingListLocked()
 }
 
 // UpdateSupportingList updates the complete supporting list for an account
@@ -215,7 +225,7 @@ func (sm *StateManager) UpdateSupportingList(accountID string, creators []Suppor
 	defer sm.mu.Unlock()
 
 	sm.supportingList[accountID] = creators
-	return sm.SaveSupportingList()
+	return sm.saveSupportingListLocked()
 }
 
 // GetSupportingList returns the supporting list for all accounts

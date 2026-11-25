@@ -10,6 +10,8 @@ version: 2
 
 builds:
   - main: ./cmd/fanbox-dl
+    flags:
+      - -trimpath
     env:
       - CGO_ENABLED=0
     goos:
@@ -35,6 +37,16 @@ archives:
       {{- else if eq .Arch "386" }}i386
       {{- else }}{{ .Arch }}{{ end }}
       {{- if .Arm }}v{{ .Arm }}{{ end }}
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  github:
+    owner: ciallo-bird
+    name: fanbox-dl
+  prerelease: auto
+  make_latest: true
 
 changelog:
   sort: asc

@@ -2,6 +2,7 @@ package fanbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -140,6 +141,9 @@ func (rd *RobustDownloader) DownloadWithResume(ctx context.Context, url string, 
 			cancel()
 
 			if err != nil {
+				if errors.Is(err, ErrInvalidSession) || errors.Is(err, ErrStatusForbidden) || ctx.Err() != nil {
+					return err
+				}
 				chunkRetries++
 				slog.WarnContext(ctx, "Chunk download failed",
 					"offset", currentOffset,
@@ -152,7 +156,11 @@ func (rd *RobustDownloader) DownloadWithResume(ctx context.Context, url string, 
 					if waitDur > 30*time.Second {
 						waitDur = 30 * time.Second
 					}
-					time.Sleep(waitDur)
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(waitDur):
+					}
 					continue
 				}
 
@@ -249,6 +257,9 @@ renamed:
 func (rd *RobustDownloader) getFileSize(ctx context.Context, url string) (int64, bool, error) {
 	resp, err := rd.client.Request(ctx, http.MethodHead, url)
 	if err != nil {
+		if errors.Is(err, ErrInvalidSession) || errors.Is(err, ErrStatusForbidden) || ctx.Err() != nil {
+			return 0, false, err
+		}
 		// HEAD not supported, try GET with Range: bytes=0-0
 		headers := map[string]string{"Range": "bytes=0-0"}
 		resp, err = rd.client.RequestWithHeaders(ctx, http.MethodGet, url, headers)
@@ -262,6 +273,12 @@ func (rd *RobustDownloader) getFileSize(ctx context.Context, url string) (int64,
 		}
 	}()
 
+	if resp.StatusCode == http.StatusForbidden {
+		return 0, false, ErrStatusForbidden
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return 0, false, ErrInvalidSession
+	}
 	if resp.StatusCode != 200 && resp.StatusCode != 206 {
 		return 0, false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
@@ -297,6 +314,12 @@ func (rd *RobustDownloader) downloadChunk(ctx context.Context, url string, file 
 		_ = resp.Body.Close()
 	}()
 
+	if resp.StatusCode == http.StatusForbidden {
+		return 0, ErrStatusForbidden
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return 0, ErrInvalidSession
+	}
 	if resp.StatusCode != 206 && resp.StatusCode != 200 {
 		return 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}

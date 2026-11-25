@@ -30,7 +30,7 @@ type Checker struct {
 
 	// Download options
 	DownloadOnMissing  bool
-	DownloadWorkers   int
+	DownloadWorkers    int
 	HTMLGenerator      *HTMLGenerator
 	GigafileDownloader *GigafileDownloader
 	DriveDownloader    *DriveDownloader
@@ -91,6 +91,9 @@ func (c *Checker) Run(ctx context.Context, creatorID string) error {
 		for _, post := range content.Body {
 			result, err := c.checkPost(ctx, post)
 			if err != nil {
+				if errors.Is(err, ErrInvalidSession) || errors.Is(err, ErrStatusForbidden) || ctx.Err() != nil {
+					return err
+				}
 				slog.WarnContext(ctx, "Failed to check post", "post_id", post.ID, "error", err)
 				continue
 			}
@@ -111,11 +114,14 @@ func (c *Checker) Run(ctx context.Context, creatorID string) error {
 
 func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error) {
 	result := CheckResult{
-		PostID:    post.ID,
-		PostTitle: post.Title,
+		PostID:     post.ID,
+		PostTitle:  post.Title,
 		IsComplete: true,
 	}
 
+	if post.IsRestricted {
+		return result, nil
+	}
 	// Get post info for full details
 	postResp := PostInfoResponse{}
 	err := c.OfficialAPIClient.RequestAndUnwrapJSON(
@@ -131,6 +137,9 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 		return result, fmt.Errorf("get post: %w", err)
 	}
 	post = postResp.Body
+	if post.IsRestricted || post.Body == nil {
+		return result, nil
+	}
 
 	// Check text content
 	if !c.SkipTexts && post.GetTextContent() != "" {
@@ -143,7 +152,7 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 			result.IsComplete = false
 			// Download missing text if enabled
 			if c.DownloadOnMissing {
-				go c.downloadText(ctx, post)
+				c.downloadText(ctx, post)
 			}
 		}
 	}
@@ -159,7 +168,7 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 			result.IsComplete = false
 			// Download missing JSON if enabled
 			if c.DownloadOnMissing {
-				go c.downloadJSON(ctx, post)
+				c.downloadJSON(ctx, post)
 			}
 		}
 	}
@@ -175,7 +184,9 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 			result.IsComplete = false
 			// Download missing HTML if enabled
 			if c.DownloadOnMissing {
-				go c.downloadHTML(ctx, post)
+				if err := c.downloadHTML(ctx, post); err != nil {
+					return result, err
+				}
 			}
 		}
 	}
@@ -209,11 +220,11 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 			if _, ok := d.(Image); ok {
 				result.MissingImages = append(result.MissingImages, filepath.Base(fileName))
 			} else {
-			result.MissingFiles = append(result.MissingFiles, filepath.Base(fileName))
+				result.MissingFiles = append(result.MissingFiles, filepath.Base(fileName))
 			}
 			result.IsComplete = false
 
-			// Collect missing downloadables for async download
+			// Collect missing assets for the bounded repair pool.
 			if c.DownloadOnMissing {
 				missingDownloadables = append(missingDownloadables, struct {
 					index int
@@ -223,9 +234,11 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 		}
 	}
 
-	// Download missing files asynchronously if enabled
+	// Keep repair work bounded and finish it before moving to the next post.
 	if c.DownloadOnMissing && len(missingDownloadables) > 0 {
-		go c.downloadMissingAssets(ctx, post, missingDownloadables)
+		if err := c.downloadMissingAssets(ctx, post, missingDownloadables); err != nil {
+			return result, err
+		}
 	}
 
 	return result, nil
@@ -268,7 +281,7 @@ func (c *Checker) logSummary(ctx context.Context, results *CheckResults) {
 	}
 }
 
-// downloadText downloads missing text content asynchronously
+// downloadText saves missing text content.
 func (c *Checker) downloadText(ctx context.Context, post Post) {
 	ctx = ctxval.AddSlogAttrs(ctx, slog.String("post_id", post.ID), slog.String("title", post.Title))
 	slog.InfoContext(ctx, "Downloading missing text content")
@@ -280,7 +293,7 @@ func (c *Checker) downloadText(ctx context.Context, post Post) {
 	}
 }
 
-// downloadJSON downloads missing JSON asynchronously
+// downloadJSON saves missing JSON.
 func (c *Checker) downloadJSON(ctx context.Context, post Post) {
 	ctx = ctxval.AddSlogAttrs(ctx, slog.String("post_id", post.ID), slog.String("title", post.Title))
 	slog.InfoContext(ctx, "Downloading missing JSON")
@@ -298,30 +311,26 @@ func (c *Checker) downloadJSON(ctx context.Context, post Post) {
 	}
 }
 
-// downloadHTML downloads missing HTML asynchronously
-func (c *Checker) downloadHTML(ctx context.Context, post Post) {
+// downloadHTML downloads missing HTML and its external files.
+func (c *Checker) downloadHTML(ctx context.Context, post Post) error {
 	ctx = ctxval.AddSlogAttrs(ctx, slog.String("post_id", post.ID), slog.String("title", post.Title))
 	slog.InfoContext(ctx, "Downloading missing HTML")
 
 	if c.HTMLGenerator == nil {
-		slog.ErrorContext(ctx, "HTML generator not configured")
-		return
+		return fmt.Errorf("HTML generator not configured")
 	}
 
 	htmlContent := c.HTMLGenerator.GenerateHTML(post, c.CreatorName)
 	if err := c.Storage.SaveHTML(post, htmlContent); err != nil {
-		slog.ErrorContext(ctx, "Failed to download HTML", "error", err)
-	} else {
-		slog.InfoContext(ctx, "Successfully downloaded HTML")
-
-		// Handle external links if enabled
-		c.handleExternalLinks(ctx, post, htmlContent)
+		return fmt.Errorf("save HTML: %w", err)
 	}
+	return c.handleExternalLinks(ctx, post, htmlContent)
 }
 
 // handleExternalLinks extracts and downloads external links from HTML content
-func (c *Checker) handleExternalLinks(ctx context.Context, post Post, htmlContent string) {
+func (c *Checker) handleExternalLinks(ctx context.Context, post Post, htmlContent string) error {
 	saveDir := c.Storage.makePostDir(post)
+	var tasks []func() error
 
 	// Handle gigafile links
 	if c.GigafileDownloader != nil {
@@ -329,7 +338,7 @@ func (c *Checker) handleExternalLinks(ctx context.Context, post Post, htmlConten
 		if len(gigafileURLs) > 0 {
 			slog.InfoContext(ctx, "Found gigafile links", "count", len(gigafileURLs))
 			for _, url := range gigafileURLs {
-				go func(url string) {
+				tasks = append(tasks, func() error {
 					slog.InfoContext(ctx, "Downloading gigafile", "url", url)
 					meta := DownloadStateMeta{
 						CreatorID: post.CreatorID,
@@ -338,10 +347,8 @@ func (c *Checker) handleExternalLinks(ctx context.Context, post Post, htmlConten
 						AssetType: "gigafile",
 						URL:       url,
 					}
-					if err := c.GigafileDownloader.DownloadFile(ctx, url, saveDir, meta); err != nil {
-						slog.ErrorContext(ctx, "Failed to download gigafile", "url", url, "error", err)
-					}
-				}(url)
+					return c.GigafileDownloader.DownloadFile(ctx, url, saveDir, meta)
+				})
 			}
 		}
 	}
@@ -352,7 +359,7 @@ func (c *Checker) handleExternalLinks(ctx context.Context, post Post, htmlConten
 		if len(driveURLs) > 0 {
 			slog.InfoContext(ctx, "Found Google Drive links", "count", len(driveURLs))
 			for _, url := range driveURLs {
-				go func(url string) {
+				tasks = append(tasks, func() error {
 					slog.InfoContext(ctx, "Downloading Google Drive file", "url", url)
 					meta := DownloadStateMeta{
 						CreatorID: post.CreatorID,
@@ -361,20 +368,19 @@ func (c *Checker) handleExternalLinks(ctx context.Context, post Post, htmlConten
 						AssetType: "drive",
 						URL:       url,
 					}
-					if err := c.DriveDownloader.DownloadFile(ctx, url, saveDir, meta); err != nil {
-						slog.ErrorContext(ctx, "Failed to download Google Drive file", "url", url, "error", err)
-					}
-				}(url)
+					return c.DriveDownloader.DownloadFile(ctx, url, saveDir, meta)
+				})
 			}
 		}
 	}
+	return runDownloadTasks(ctx, tasks, c.DownloadWorkers)
 }
 
-// downloadMissingAssets downloads missing assets (images/files) asynchronously
+// downloadMissingAssets downloads missing assets with a bounded worker pool.
 func (c *Checker) downloadMissingAssets(ctx context.Context, post Post, missingDownloadables []struct {
 	index int
 	d     Downloadable
-}) {
+}) error {
 	ctx = ctxval.AddSlogAttrs(ctx, slog.String("post_id", post.ID), slog.String("title", post.Title))
 	slog.InfoContext(ctx, "Downloading missing assets", "count", len(missingDownloadables))
 
@@ -391,9 +397,7 @@ func (c *Checker) downloadMissingAssets(ctx context.Context, post Post, missingD
 		})
 	}
 
-	if err := c.runTasks(ctx, tasks, workers); err != nil {
-		slog.ErrorContext(ctx, "Failed to download some assets", "error", err)
-	}
+	return runDownloadTasks(ctx, tasks, workers)
 }
 
 // downloadAsset downloads a single asset
@@ -474,6 +478,9 @@ func (c *Checker) downloadWithRetry(ctx context.Context, post Post, order int, d
 
 		if err := c.download(ctx, post, order, d); err != nil {
 			lastErr = err
+			if errors.Is(err, ErrInvalidSession) || errors.Is(err, ErrStatusForbidden) || ctx.Err() != nil {
+				return err
+			}
 			if shouldRetry(err) {
 				slog.WarnContext(ctx, "Download failed, will retry",
 					"error", err,
@@ -529,72 +536,11 @@ func (c *Checker) download(ctx context.Context, post Post, order int, d Download
 		PostID:    post.ID,
 		PostTitle: post.Title,
 		AssetID:   d.GetID(),
-		AssetType:  assetType,
+		AssetType: assetType,
 		URL:       targetURL,
 	}
 
 	// Use robust downloader with chunked resume
 	downloader := NewRobustDownloader(c.OfficialAPIClient)
 	return downloader.DownloadWithResume(ctx, targetURL, filePath, meta)
-}
-
-// runTasks runs tasks with worker pool
-func (c *Checker) runTasks(ctx context.Context, tasks []func() error, workers int) error {
-	if len(tasks) == 0 {
-		return nil
-	}
-	if workers <= 0 {
-		workers = 1
-	}
-	if workers == 1 {
-		for _, task := range tasks {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-			if err := task(); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	sem := make(chan struct{}, workers)
-	errCh := make(chan error, len(tasks))
-	doneCh := make(chan struct{})
-
-	go func() {
-		defer close(doneCh)
-		for _, task := range tasks {
-			select {
-			case <-ctx.Done():
-				errCh <- ctx.Err()
-				return
-			case sem <- struct{}{}:
-			}
-
-			task := task
-			go func() {
-				defer func() { <-sem }()
-				errCh <- task()
-			}()
-		}
-	}()
-
-	var firstErr error
-	completed := 0
-	for completed < len(tasks) {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-doneCh:
-		case err := <-errCh:
-			completed++
-			if err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
 }

@@ -1,6 +1,8 @@
 package fanbox
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -10,14 +12,128 @@ type Pagination struct {
 	Pages []string `json:"body"`
 }
 
+// UnmarshalJSON supports both legacy body arrays and current body.pageUrls arrays.
+func (p *Pagination) UnmarshalJSON(data []byte) error {
+	pages, err := decodeResponseBodyArray[string](data, "pageUrls")
+	if err != nil {
+		return fmt.Errorf("decode pagination response: %w", err)
+	}
+	p.Pages = pages
+	return nil
+}
+
 // ListCreatorResponse represents the response of https://api.fanbox.cc/post.listCreator.
 type ListCreatorResponse struct {
 	Body []Post `json:"body"`
 }
 
+// UnmarshalJSON supports both legacy body arrays and current body.posts arrays.
+func (r *ListCreatorResponse) UnmarshalJSON(data []byte) error {
+	posts, err := decodeResponseBodyArray[Post](data, "posts")
+	if err != nil {
+		return fmt.Errorf("decode list creator response: %w", err)
+	}
+	r.Body = posts
+	return nil
+}
+
 // PostInfoResponse represents the response of https://api.fanbox.cc/post.info.
 type PostInfoResponse struct {
 	Body Post `json:"body"`
+}
+
+// UnmarshalJSON supports both legacy body objects and current body.post objects.
+// An absent or restricted post decodes to a zero Post so callers can skip it.
+func (r *PostInfoResponse) UnmarshalJSON(data []byte) error {
+	*r = PostInfoResponse{}
+	body, err := decodeResponseBody(data)
+	if err != nil {
+		return fmt.Errorf("decode post info response: %w", err)
+	}
+	if body == nil {
+		return nil
+	}
+
+	var probe struct {
+		Post json.RawMessage `json:"post"`
+		ID   json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return fmt.Errorf("decode post info response body: %w", err)
+	}
+	postJSON := probe.Post
+	if isNullJSON(postJSON) {
+		if isNullJSON(probe.ID) {
+			return nil
+		}
+		postJSON = body
+	}
+	if err := json.Unmarshal(postJSON, &r.Body); err != nil {
+		return fmt.Errorf("decode post info response post: %w", err)
+	}
+	return nil
+}
+
+type responseEnvelope struct {
+	Body  json.RawMessage `json:"body"`
+	Error json.RawMessage `json:"error"`
+}
+
+func decodeResponseBody(data []byte) (json.RawMessage, error) {
+	var response responseEnvelope
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, fmt.Errorf("decode response envelope: %w", err)
+	}
+	if !isNullJSON(response.Error) && !bytes.Equal(bytes.TrimSpace(response.Error), []byte("false")) {
+		var code string
+		if json.Unmarshal(response.Error, &code) == nil && code == "authentication_required" {
+			return nil, ErrInvalidSession
+		}
+		return nil, fmt.Errorf("FANBOX API returned an error")
+	}
+	body := bytes.TrimSpace(response.Body)
+	if isNullJSON(body) {
+		return nil, nil
+	}
+	return body, nil
+}
+
+func decodeResponseBodyArray[T any](data []byte, wrappedField string) ([]T, error) {
+	body, err := decodeResponseBody(data)
+	if err != nil {
+		return nil, err
+	}
+	if body == nil {
+		return nil, nil
+	}
+	if body[0] == '{' {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err != nil {
+			return nil, fmt.Errorf("decode response body: %w", err)
+		}
+		wrapped, ok := fields[wrappedField]
+		if !ok {
+			return nil, fmt.Errorf("response body does not contain %q", wrappedField)
+		}
+		if isNullJSON(wrapped) {
+			return nil, nil
+		}
+		var values []T
+		if err := json.Unmarshal(wrapped, &values); err != nil {
+			return nil, fmt.Errorf("decode response body field %q: %w", wrappedField, err)
+		}
+		return values, nil
+	}
+	var values []T
+	if err := json.Unmarshal(body, &values); err != nil {
+		return nil, fmt.Errorf("decode response body: %w", err)
+	}
+	return values, nil
+}
+
+func isNullJSON(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	return len(raw) == 0 || bytes.Equal(raw, []byte("null"))
 }
 
 // Post represents post attributes.
@@ -55,53 +171,53 @@ func (p *Post) GetTextContent() string {
 }
 
 func (pb *PostBody) ExtractText() string {
-    var textContent strings.Builder
-    
-    // Handle article/blog type posts with blocks
-    if pb.Blocks != nil {
-        for _, block := range *pb.Blocks {
-            if block.Type == "p" && block.Text != "" {
-                textContent.WriteString(block.Text)
-                textContent.WriteString("\n\n")
-            } else if block.Type == "image" && block.ImageID != nil {
-                textContent.WriteString("[Image: " + *block.ImageID + "]\n\n")
-            } else if block.Type == "file" && block.FileID != nil {
-                fileInfo := (*pb.FileMap)[*block.FileID]
-                fileLabel := fileInfo.ID
-                if fileInfo.Name != "" {
-                    fileLabel = fileInfo.Name
-                }
-                textContent.WriteString("[File: " + fileLabel + "." + fileInfo.Extension + "]\n\n")
-            }
-        }
-    }
-    
-    // Handle image type posts with text field
-    if textContent.Len() == 0 && pb.Text != "" {
-        textContent.WriteString(pb.Text)
-        
-        // Add file information at the end for file-type posts
-        if pb.Files != nil {
-            textContent.WriteString("\n\n--- Files ---\n")
-            for _, file := range *pb.Files {
-                fileLabel := file.ID
-                if file.Name != "" {
-                    fileLabel = file.Name
-                }
-                textContent.WriteString(fmt.Sprintf("[File: %s.%s]\n", fileLabel, file.Extension))
-            }
-        }
-        
-        // Add image information at the end for image-type posts
-        if pb.Images != nil {
-            textContent.WriteString("\n\n--- Images ---\n")
-            for _, img := range *pb.Images {
-                textContent.WriteString(fmt.Sprintf("[Image: %s.%s]\n", img.ID, img.Extension))
-            }
-        }
-    }
-    
-    return strings.TrimSpace(textContent.String())
+	var textContent strings.Builder
+
+	// Handle article/blog type posts with blocks
+	if pb.Blocks != nil {
+		for _, block := range *pb.Blocks {
+			if block.Type == "p" && block.Text != "" {
+				textContent.WriteString(block.Text)
+				textContent.WriteString("\n\n")
+			} else if block.Type == "image" && block.ImageID != nil {
+				textContent.WriteString("[Image: " + *block.ImageID + "]\n\n")
+			} else if block.Type == "file" && block.FileID != nil {
+				fileInfo := (*pb.FileMap)[*block.FileID]
+				fileLabel := fileInfo.ID
+				if fileInfo.Name != "" {
+					fileLabel = fileInfo.Name
+				}
+				textContent.WriteString("[File: " + fileLabel + "." + fileInfo.Extension + "]\n\n")
+			}
+		}
+	}
+
+	// Handle image type posts with text field
+	if textContent.Len() == 0 && pb.Text != "" {
+		textContent.WriteString(pb.Text)
+
+		// Add file information at the end for file-type posts
+		if pb.Files != nil {
+			textContent.WriteString("\n\n--- Files ---\n")
+			for _, file := range *pb.Files {
+				fileLabel := file.ID
+				if file.Name != "" {
+					fileLabel = file.Name
+				}
+				textContent.WriteString(fmt.Sprintf("[File: %s.%s]\n", fileLabel, file.Extension))
+			}
+		}
+
+		// Add image information at the end for image-type posts
+		if pb.Images != nil {
+			textContent.WriteString("\n\n--- Images ---\n")
+			for _, img := range *pb.Images {
+				textContent.WriteString(fmt.Sprintf("[Image: %s.%s]\n", img.ID, img.Extension))
+			}
+		}
+	}
+
+	return strings.TrimSpace(textContent.String())
 }
 
 type Block struct {
@@ -179,6 +295,10 @@ func (i Image) GetName() string {
 }
 
 func (f *Post) ListDownloadable() []Downloadable {
+	if f.Body == nil {
+		return nil
+	}
+
 	if f.Body.Images != nil {
 		res := make([]Downloadable, 0, len(*f.Body.Images))
 		for _, v := range *f.Body.Images {
@@ -215,12 +335,32 @@ type PlanListSupportingResponse struct {
 	Body []Plan `json:"body"`
 }
 
+// UnmarshalJSON supports both legacy body arrays and current body.plans arrays.
+func (r *PlanListSupportingResponse) UnmarshalJSON(data []byte) error {
+	plans, err := decodeResponseBodyArray[Plan](data, "plans")
+	if err != nil {
+		return fmt.Errorf("decode list supporting plans response: %w", err)
+	}
+	r.Body = plans
+	return nil
+}
+
 type Plan struct {
 	CreatorID string `json:"creatorId"`
 }
 
 type CreatorListFollowingResponse struct {
 	Body []Creator `json:"body"`
+}
+
+// UnmarshalJSON supports both legacy body arrays and current body.creators arrays.
+func (r *CreatorListFollowingResponse) UnmarshalJSON(data []byte) error {
+	creators, err := decodeResponseBodyArray[Creator](data, "creators")
+	if err != nil {
+		return fmt.Errorf("decode list following creators response: %w", err)
+	}
+	r.Body = creators
+	return nil
 }
 
 type Creator struct {

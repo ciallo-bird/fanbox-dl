@@ -50,7 +50,7 @@ func (c *CreatorIDLister) all(ctx context.Context, in *CreatorIDListerDoInput) (
 		plans := PlanListSupportingResponse{}
 		err := c.OfficialAPIClient.RequestAndUnwrapJSON(ctx, http.MethodGet, "https://api.fanbox.cc/plan.listSupporting", &plans)
 		if err != nil {
-			return nil, fmt.Errorf("list supporintg plans: %w", err)
+			return nil, fmt.Errorf("list supporting plans: %w", err)
 		}
 		for _, p := range plans.Body {
 			ids[p.CreatorID] = nil
@@ -58,7 +58,7 @@ func (c *CreatorIDLister) all(ctx context.Context, in *CreatorIDListerDoInput) (
 	}
 
 	if in.IncludeFollowing {
-		following := PlanListSupportingResponse{}
+		following := CreatorListFollowingResponse{}
 		err := c.OfficialAPIClient.RequestAndUnwrapJSON(ctx, http.MethodGet, "https://api.fanbox.cc/creator.listFollowing", &following)
 		if err != nil {
 			return nil, fmt.Errorf("list following creators: %w", err)

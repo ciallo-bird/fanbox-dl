@@ -1,10 +1,16 @@
-.PHONY: build release
+.PHONY: test test-integration build build-win tag release
 
 test:
 	go test ./...
 
+test-integration:
+	go test -tags=integration ./...
+
 build:
-	goreleaser build --single-target --skip=validate --clean
+	goreleaser build --single-target --snapshot --clean
+
+build-win:
+	GOOS=windows GOARCH=amd64 GOAMD64=v1 goreleaser build --single-target --snapshot --clean
 
 # make tag TAG=vx.x.x
 tag:

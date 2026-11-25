@@ -4,12 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"mime"
 	"net/http"
-	"net/http/httputil"
 	"reflect"
 	"sync"
 
@@ -18,11 +17,14 @@ import (
 )
 
 type OfficialAPIClient struct {
-	HTTPClient *retryablehttp.Client
-	Cookie     string
-	UserAgent  string
-	rateLimiter *rate.Limiter
-	rateLimiterMu sync.RWMutex
+	HTTPClient     *retryablehttp.Client
+	Cookie         string
+	UserAgent      string
+	rateLimiter    *rate.Limiter
+	initOnce       sync.Once
+	transport      *sessionTransport
+	requestMu      sync.Mutex
+	rateLimiterMu  sync.RWMutex
 	onJSONReceived JSONReceivedCallback
 }
 
@@ -33,6 +35,10 @@ type JSONReceivedCallback func(url string, jsonData []byte)
 func (c *OfficialAPIClient) SetRateLimit(requestsPerSecond float64) {
 	c.rateLimiterMu.Lock()
 	defer c.rateLimiterMu.Unlock()
+	if requestsPerSecond <= 0 {
+		c.rateLimiter = nil
+		return
+	}
 	c.rateLimiter = rate.NewLimiter(rate.Limit(requestsPerSecond), 1)
 }
 
@@ -44,70 +50,50 @@ func (c *OfficialAPIClient) SetJSONSetCallback(callback JSONReceivedCallback) {
 }
 
 func (c *OfficialAPIClient) Request(ctx context.Context, method string, url string) (*http.Response, error) {
-	// Wait for rate limiter if configured
-	c.rateLimiterMu.RLock()
-	limiter := c.rateLimiter
-	c.rateLimiterMu.RUnlock()
-	
-	if limiter != nil {
-		if err := limiter.Wait(ctx); err != nil {
-			return nil, fmt.Errorf("rate limit wait: %w", err)
-		}
-	}
-
-	req, err := retryablehttp.NewRequest(method, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("http request building error: %w", err)
-	}
-
-	req = req.WithContext(ctx)
-	req.Header.Set("Cookie", c.Cookie)
-	req.Header.Set("Origin", "https://www.fanbox.cc") // If Origin header is not set, FANBOX returns HTTP 400 error.
-	req.Header.Set("Referer", "https://www.fanbox.cc/")
-	req.Header.Set("User-Agent", c.UserAgent)
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Accept-Encoding", "gzip")
-
-	return c.HTTPClient.Do(req)
+	return c.RequestWithHeaders(ctx, method, url, nil)
 }
 
 func (c *OfficialAPIClient) RequestWithHeaders(ctx context.Context, method string, url string, headers map[string]string) (*http.Response, error) {
-	// Wait for rate limiter if configured
-	c.rateLimiterMu.RLock()
-	limiter := c.rateLimiter
-	c.rateLimiterMu.RUnlock()
-
-	if limiter != nil {
-		if err := limiter.Wait(ctx); err != nil {
-			return nil, fmt.Errorf("rate limit wait: %w", err)
-		}
-	}
-
-	req, err := retryablehttp.NewRequest(method, url, nil)
+	c.initOnce.Do(c.initSession)
+	req, err := retryablehttp.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("http request building error: %w", err)
 	}
-
-	req = req.WithContext(ctx)
-	req.Header.Set("Cookie", c.Cookie)
+	if isFanboxURL(req.URL) {
+		// Let the outer HTTP client finish updating its jar before another request.
+		c.requestMu.Lock()
+		defer c.requestMu.Unlock()
+	}
 	req.Header.Set("Origin", "https://www.fanbox.cc")
 	req.Header.Set("Referer", "https://www.fanbox.cc/")
 	req.Header.Set("User-Agent", c.UserAgent)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Accept-Encoding", "gzip")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-
-	return c.HTTPClient.Do(req)
+	if isFanboxURL(req.URL) {
+		if err := c.transport.failure(); err != nil {
+			return nil, err
+		}
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if isFanboxURL(req.URL) {
+		if err := c.transport.failure(); err != nil {
+			_ = resp.Body.Close()
+			return nil, err
+		}
+	}
+	return resp, nil
 }
 
 func (c *OfficialAPIClient) RequestAndUnwrapJSON(ctx context.Context, method string, url string, v interface{}) error {
 	rv := reflect.ValueOf(v)
-	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return fmt.Errorf("v should be a pointer")
 	}
-
 	resp, err := c.Request(ctx, method, url)
 	if err != nil {
 		return fmt.Errorf("http error: %w", err)
@@ -116,29 +102,29 @@ func (c *OfficialAPIClient) RequestAndUnwrapJSON(ctx context.Context, method str
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
-
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status is %s", resp.Status)
 	}
-
-	// Read the entire response body first
+	c.rateLimiterMu.RLock()
+	callback := c.onJSONReceived
+	c.rateLimiterMu.RUnlock()
+	if callback == nil {
+		if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+			if errors.Is(err, ErrInvalidSession) {
+				c.transport.stop(err)
+			}
+			return fmt.Errorf("json decoding error: %w", err)
+		}
+		return nil
+	}
 	jsonData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("read response body: %w", err)
 	}
-
-	// Call the JSON callback if configured
-	c.rateLimiterMu.RLock()
-	callback := c.onJSONReceived
-	c.rateLimiterMu.RUnlock()
-	if callback != nil {
-		callback(url, jsonData)
-	}
-
-	// Decode JSON
-	if err = json.Unmarshal(jsonData, v); err != nil {
-		if dump, dumpErr := httputil.DumpResponse(resp, false); dumpErr == nil {
-			slog.Debug("Response dump", "dump", string(dump))
+	callback(url, jsonData)
+	if err := json.Unmarshal(jsonData, v); err != nil {
+		if errors.Is(err, ErrInvalidSession) {
+			c.transport.stop(err)
 		}
 		return fmt.Errorf("json decoding error: %w", err)
 	}

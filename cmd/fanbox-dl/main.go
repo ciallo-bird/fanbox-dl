@@ -20,19 +20,17 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-func resolveSessionID(c *cli.Context) string {
-	if v := c.String(sessIDFlag.Name); v != "" {
-		return v
+func resolveCookie(c *cli.Context) string {
+	if cookie := c.String(cookieFlag.Name); cookie != "" {
+		return cookie
 	}
-
-	if v := os.Getenv("FANBOXSESSID"); v != "" {
-		return v
+	if session := c.String(sessIDFlag.Name); session != "" {
+		return "FANBOXSESSID=" + session
 	}
-	if v := os.Getenv("FANBOX_COOKIE"); v != "" {
-		return v
+	if session := os.Getenv("FANBOXSESSID"); session != "" {
+		return "FANBOXSESSID=" + session
 	}
-
-	return ""
+	return os.Getenv("FANBOX_COOKIE")
 }
 
 var (
@@ -69,7 +67,7 @@ var cookieFlag = &cli.StringFlag{
 var userAgentFlag = &cli.StringFlag{
 	Name:  "user-agent",
 	Usage: "User-Agent for Fanbox API.",
-	Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+	Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
 }
 var saveDirFlag = &cli.StringFlag{
 	Name:  "save-dir",
@@ -139,8 +137,8 @@ var removeUnprintableCharsFlag = &cli.BoolFlag{
 
 var rateLimitFlag = &cli.Float64Flag{
 	Name:  "rate-limit",
-	Value: 0,
-	Usage: "Rate limit in requests per second (0 = no limit).",
+	Value: 0.5,
+	Usage: "Maximum FANBOX requests per second, including retries and downloads (0 = no limit).",
 }
 
 var saveJSONFlag = &cli.BoolFlag{
@@ -181,8 +179,8 @@ var downloadThreadsFlag = &cli.IntFlag{
 
 var timeoutFlag = &cli.DurationFlag{
 	Name:  "timeout",
-	Usage: "HTTP timeout for downloads and API requests (e.g. 30s, 5m). Default: no timeout.",
-	Value: 0,
+	Usage: "HTTP timeout for downloads and API requests (e.g. 30s, 5m). Default: 2m.",
+	Value: 2 * time.Minute,
 }
 
 var useStateManagerFlag = &cli.BoolFlag{
@@ -207,6 +205,36 @@ var checkFlag = &cli.BoolFlag{
 	Name:  "check",
 	Value: false,
 	Usage: "Check downloaded content for completeness and automatically download missing files.",
+}
+
+func newHTTPClient(c *cli.Context) (*retryablehttp.Client, error) {
+	httpClient := retryablehttp.NewClient()
+	httpClient.Logger = applog.NewRetryableLeveledLogger(slog.Default())
+	httpClient.RetryMax = 5
+	httpClient.RetryWaitMin = time.Second
+	httpClient.RetryWaitMax = 30 * time.Second
+	httpClient.HTTPClient.Timeout = c.Duration(timeoutFlag.Name)
+	if httpClient.HTTPClient.Timeout <= 0 {
+		httpClient.HTTPClient.Timeout = 2 * time.Minute
+	}
+	httpClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if err != nil {
+			return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
+		}
+		if failed, checkErr := fanbox.IsFailedToThumbnailingErr(resp); checkErr == nil && failed {
+			return false, fanbox.ErrFailedToThumbnailing
+		}
+		return retryablehttp.DefaultRetryPolicy(ctx, resp, nil)
+	}
+	transport, err := tlsclient.NewTransportWithOptions(tls_client.NewNoopLogger(), tls_client.WithClientProfile(profiles.Chrome_146_PSK))
+	if err != nil {
+		return nil, fmt.Errorf("create tls transport: %w", err)
+	}
+	httpClient.HTTPClient.Transport = transport
+	return httpClient, nil
 }
 
 var app = &cli.App{
@@ -257,18 +285,7 @@ var app = &cli.App{
 			return runCheckMode(c)
 		}
 
-		var cookieStr string
-		if sessID := resolveSessionID(c); sessID != "" {
-			slog.Debug("Using session ID", "sessid_bytes", len(sessID))
-			cookieStr = fmt.Sprintf("FANBOXSESSID=%s", sessID)
-		}
-		if v := c.String(cookieFlag.Name); v != "" {
-			if cookieStr != "" {
-				slog.Warn("session ID and cookie are set, cookie option overrides session ID option")
-			}
-			slog.Debug("Using cookie", "cookie_bytes", len(v))
-			cookieStr = v
-		}
+		cookieStr := resolveCookie(c)
 
 		// Parse date ranges if provided
 		var startDate, endDate *time.Time
@@ -290,39 +307,10 @@ var app = &cli.App{
 			endDate = &parsedTime
 		}
 
-		httpClient := retryablehttp.NewClient()
-		httpClient.Logger = slog.Default()
-		// Set reasonable retry limits to prevent hanging
-		httpClient.RetryMax = 5
-		httpClient.RetryWaitMin = 1 * time.Second
-		httpClient.RetryWaitMax = 30 * time.Second
-		if timeout := c.Duration(timeoutFlag.Name); timeout > 0 {
-			httpClient.HTTPClient.Timeout = timeout
-			slog.Info("HTTP timeout enabled", "timeout", timeout.String())
-		} else {
-			// Set default timeout if none specified (prevents hanging on slow/stalled connections)
-			httpClient.HTTPClient.Timeout = 2 * time.Minute
-		}
-		httpClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
-			// Check if context is cancelled
-			if ctx.Err() != nil {
-				return false, ctx.Err()
-			}
-			if err != nil {
-				return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
-			}
-			b, err := fanbox.IsFailedToThumbnailingErr(resp)
-			if err == nil && b {
-				return false, fanbox.ErrFailedToThumbnailing
-			}
-			return retryablehttp.DefaultRetryPolicy(ctx, resp, nil)
-		}
-
-		tlsTransp, err := tlsclient.NewTransportWithOptions(tls_client.NewNoopLogger(), tls_client.WithClientProfile(profiles.Chrome_131))
+		httpClient, err := newHTTPClient(c)
 		if err != nil {
-			return fmt.Errorf("create tls transport: %w", err)
+			return err
 		}
-		httpClient.HTTPClient.Transport = tlsTransp
 
 		storage := &fanbox.LocalStorage{
 			SaveDir:                c.String(saveDirFlag.Name),
@@ -434,47 +422,11 @@ var app = &cli.App{
 }
 
 func runCheckMode(c *cli.Context) error {
-	// Check mode validates downloaded content and downloads missing files
-	var cookieStr string
-	if sessID := resolveSessionID(c); sessID != "" {
-		cookieStr = fmt.Sprintf("FANBOXSESSID=%s", sessID)
-	}
-	if v := c.String(cookieFlag.Name); v != "" {
-		cookieStr = v
-	}
-
-	httpClient := retryablehttp.NewClient()
-	httpClient.Logger = slog.Default()
-	// Set reasonable retry limits to prevent hanging
-	httpClient.RetryMax = 5
-	httpClient.RetryWaitMin = 1 * time.Second
-	httpClient.RetryWaitMax = 30 * time.Second
-	if timeout := c.Duration(timeoutFlag.Name); timeout > 0 {
-		httpClient.HTTPClient.Timeout = timeout
-	} else {
-		// Set default timeout if none specified (prevents hanging on slow/stalled connections)
-		httpClient.HTTPClient.Timeout = 2 * time.Minute
-	}
-	httpClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
-		// Check if context is cancelled
-		if ctx.Err() != nil {
-			return false, ctx.Err()
-		}
-		if err != nil {
-			return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
-		}
-		b, err := fanbox.IsFailedToThumbnailingErr(resp)
-		if err == nil && b {
-			return false, fanbox.ErrFailedToThumbnailing
-		}
-		return retryablehttp.DefaultRetryPolicy(ctx, resp, nil)
-	}
-
-	tlsTransp, err := tlsclient.NewTransportWithOptions(tls_client.NewNoopLogger(), tls_client.WithClientProfile(profiles.Chrome_131))
+	cookieStr := resolveCookie(c)
+	httpClient, err := newHTTPClient(c)
 	if err != nil {
-		return fmt.Errorf("create tls transport: %w", err)
+		return err
 	}
-	httpClient.HTTPClient.Transport = tlsTransp
 
 	storage := &fanbox.LocalStorage{
 		SaveDir:                c.String(saveDirFlag.Name),
@@ -569,17 +521,15 @@ func runCheckMode(c *cli.Context) error {
 	}
 
 	slog.InfoContext(ctx, "Check completed.", "duration", time.Since(startedAt).Round(time.Millisecond*100))
-	slog.InfoContext(ctx, "Note: Missing files are being downloaded asynchronously in the background")
 	return nil
 }
 
 func main() {
 	if err := run(); err != nil {
 		slog.Error("fanbox-dl Error", "error", err)
-		slog.Error("The error log seems a bug, please open an issue on GitHub", "url", "https://github.com/hareku/fanbox-dl/issues")
 
-		if errors.Is(err, fanbox.ErrStatusForbidden) {
-			slog.Error("This 403 error may occur when connecting from an IP address outside of Japan. Please try again from VPN or other IP addresses in Japan.")
+		if errors.Is(err, fanbox.ErrInvalidSession) || errors.Is(err, fanbox.ErrStatusForbidden) {
+			slog.Error("Stopped to protect the session. Do not retry repeatedly; check the browser login and use the same network/IP as the browser.")
 		}
 		os.Exit(1)
 	}
