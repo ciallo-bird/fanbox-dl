@@ -76,6 +76,7 @@ func (c *Checker) Run(ctx context.Context, creatorID string) error {
 	slog.DebugContext(ctx, "Found pages", "pages", len(pagination.Pages))
 
 	results := &CheckResults{}
+	var checkErrors []error
 
 	for i, page := range pagination.Pages {
 		content := ListCreatorResponse{}
@@ -94,8 +95,9 @@ func (c *Checker) Run(ctx context.Context, creatorID string) error {
 				if errors.Is(err, ErrInvalidSession) || errors.Is(err, ErrStatusForbidden) || ctx.Err() != nil {
 					return err
 				}
+				result.IsComplete = false
+				checkErrors = append(checkErrors, fmt.Errorf("check post %s: %w", post.ID, err))
 				slog.WarnContext(ctx, "Failed to check post", "post_id", post.ID, "error", err)
-				continue
 			}
 			results.TotalPosts++
 			results.Results = append(results.Results, result)
@@ -109,7 +111,7 @@ func (c *Checker) Run(ctx context.Context, creatorID string) error {
 	}
 
 	c.logSummary(ctx, results)
-	return nil
+	return errors.Join(checkErrors...)
 }
 
 func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error) {
@@ -141,6 +143,7 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 		return result, nil
 	}
 
+	var repairs []func() error
 	// Check text content
 	if !c.SkipTexts && post.GetTextContent() != "" {
 		textExists, err := c.Storage.TextExists(post)
@@ -152,7 +155,7 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 			result.IsComplete = false
 			// Download missing text if enabled
 			if c.DownloadOnMissing {
-				c.downloadText(ctx, post)
+				repairs = append(repairs, func() error { return c.downloadText(ctx, post) })
 			}
 		}
 	}
@@ -168,7 +171,7 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 			result.IsComplete = false
 			// Download missing JSON if enabled
 			if c.DownloadOnMissing {
-				c.downloadJSON(ctx, post)
+				repairs = append(repairs, func() error { return c.downloadJSON(ctx, post) })
 			}
 		}
 	}
@@ -184,9 +187,7 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 			result.IsComplete = false
 			// Download missing HTML if enabled
 			if c.DownloadOnMissing {
-				if err := c.downloadHTML(ctx, post); err != nil {
-					return result, err
-				}
+				repairs = append(repairs, func() error { return c.downloadHTML(ctx, post) })
 			}
 		}
 	}
@@ -198,25 +199,37 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 		d     Downloadable
 	}{}
 
-	for i, d := range downloadables {
-		if _, ok := d.(File); ok && c.SkipFiles {
-			continue
-		}
-		if _, ok := d.(Image); ok && c.SkipImages {
-			continue
+	var nextImgOrder, nextFileOrder int
+	for _, d := range downloadables {
+		var order int
+		switch d.(type) {
+		case Image:
+			order = nextImgOrder
+			nextImgOrder++
+			if c.SkipImages {
+				continue
+			}
+		case File:
+			order = nextFileOrder
+			nextFileOrder++
+			if c.SkipFiles {
+				continue
+			}
+		default:
+			return result, fmt.Errorf("unsupported asset type: %+v", d)
 		}
 
 		if d.GetID() == "" {
 			continue
 		}
 
-		exists, err := c.Storage.Exist(post, i, d)
+		exists, err := c.Storage.Exist(post, order, d)
 		if err != nil {
 			return result, err
 		}
 
 		if !exists {
-			fileName := c.Storage.MakeFileName(post, i, d)
+			fileName := c.Storage.MakeFileName(post, order, d)
 			if _, ok := d.(Image); ok {
 				result.MissingImages = append(result.MissingImages, filepath.Base(fileName))
 			} else {
@@ -229,16 +242,35 @@ func (c *Checker) checkPost(ctx context.Context, post Post) (CheckResult, error)
 				missingDownloadables = append(missingDownloadables, struct {
 					index int
 					d     Downloadable
-				}{i, d})
+				}{order, d})
 			}
 		}
 	}
 
-	// Keep repair work bounded and finish it before moving to the next post.
+	// Discover every broken output before starting repairs, then wait for all work.
 	if c.DownloadOnMissing && len(missingDownloadables) > 0 {
-		if err := c.downloadMissingAssets(ctx, post, missingDownloadables); err != nil {
-			return result, err
+		repairs = append(repairs, func() error { return c.downloadMissingAssets(ctx, post, missingDownloadables) })
+	}
+	if c.DownloadOnMissing && (c.GigafileDownloader != nil || c.DriveDownloader != nil) {
+		repairs = append(repairs, func() error {
+			if c.HTMLGenerator == nil {
+				return fmt.Errorf("HTML generator not configured for external downloads")
+			}
+			return c.handleExternalLinks(ctx, post, c.HTMLGenerator.GenerateHTML(post, c.CreatorName))
+		})
+	}
+	var repairErrors []error
+	for _, repair := range repairs {
+		if err := repair(); err != nil {
+			result.IsComplete = false
+			if errors.Is(err, ErrInvalidSession) || errors.Is(err, ErrStatusForbidden) || ctx.Err() != nil {
+				return result, err
+			}
+			repairErrors = append(repairErrors, err)
 		}
+	}
+	if err := errors.Join(repairErrors...); err != nil {
+		return result, err
 	}
 
 	return result, nil
@@ -282,36 +314,35 @@ func (c *Checker) logSummary(ctx context.Context, results *CheckResults) {
 }
 
 // downloadText saves missing text content.
-func (c *Checker) downloadText(ctx context.Context, post Post) {
+func (c *Checker) downloadText(ctx context.Context, post Post) error {
 	ctx = ctxval.AddSlogAttrs(ctx, slog.String("post_id", post.ID), slog.String("title", post.Title))
 	slog.InfoContext(ctx, "Downloading missing text content")
 
 	if err := c.Storage.SaveText(post); err != nil {
-		slog.ErrorContext(ctx, "Failed to download text content", "error", err)
-	} else {
-		slog.InfoContext(ctx, "Successfully downloaded text content")
+		return fmt.Errorf("save text: %w", err)
 	}
+	slog.InfoContext(ctx, "Successfully downloaded text content")
+	return nil
 }
 
 // downloadJSON saves missing JSON.
-func (c *Checker) downloadJSON(ctx context.Context, post Post) {
+func (c *Checker) downloadJSON(ctx context.Context, post Post) error {
 	ctx = ctxval.AddSlogAttrs(ctx, slog.String("post_id", post.ID), slog.String("title", post.Title))
 	slog.InfoContext(ctx, "Downloading missing JSON")
 
 	jsonData, err := json.Marshal(post)
 	if err != nil {
-		slog.ErrorContext(ctx, "Failed to marshal JSON", "error", err)
-		return
+		return fmt.Errorf("marshal JSON: %w", err)
 	}
 
 	if err := c.Storage.SaveJSON(post, jsonData); err != nil {
-		slog.ErrorContext(ctx, "Failed to download JSON", "error", err)
-	} else {
-		slog.InfoContext(ctx, "Successfully downloaded JSON")
+		return fmt.Errorf("save JSON: %w", err)
 	}
+	slog.InfoContext(ctx, "Successfully downloaded JSON")
+	return nil
 }
 
-// downloadHTML downloads missing HTML and its external files.
+// downloadHTML regenerates a missing HTML export; external links are checked separately.
 func (c *Checker) downloadHTML(ctx context.Context, post Post) error {
 	ctx = ctxval.AddSlogAttrs(ctx, slog.String("post_id", post.ID), slog.String("title", post.Title))
 	slog.InfoContext(ctx, "Downloading missing HTML")
@@ -324,7 +355,7 @@ func (c *Checker) downloadHTML(ctx context.Context, post Post) error {
 	if err := c.Storage.SaveHTML(post, htmlContent); err != nil {
 		return fmt.Errorf("save HTML: %w", err)
 	}
-	return c.handleExternalLinks(ctx, post, htmlContent)
+	return nil
 }
 
 // handleExternalLinks extracts and downloads external links from HTML content
@@ -540,7 +571,7 @@ func (c *Checker) download(ctx context.Context, post Post, order int, d Download
 		URL:       targetURL,
 	}
 
-	// Use robust downloader with chunked resume
+	// Use the shared streaming downloader with resume support.
 	downloader := NewRobustDownloader(c.OfficialAPIClient)
 	return downloader.DownloadWithResume(ctx, targetURL, filePath, meta)
 }

@@ -45,7 +45,7 @@ Extract the archive before running the binary. Each release includes `checksums.
 | skip-images | Will skip downloading images from creators. This is useful when you only want to download files. | `--skip-images` | `false` |
 | skip-texts | Will skip downloading post contents as text files. | `--skip-texts` | `false` |
 | skip-on-error | Will skip downloading instead of exiting when an error occurs. | `--skip-on-error` | `false` |
-| dry-run | Will skip downloading all content from creators. | `--dry-run` | `false` |
+| dry-run | Skip downloads and writes. Combined with `--check`, report missing or zero-byte outputs without repairing them. | `--check --dry-run` | `false` |
 | verbose | Gives more detailed information about commands being executed by application. <br>Useful for debugging errors. | `--verbose` | `false` |
 | save-dir | Root directory to save content. <br>Put directory in double quotes `"` if it contains spaces. <br>Supports relative and absolute directories. | `--save-dir ./content` | `./images` |
 | user-agent | User agent for requests. Keep it aligned with the Chrome 146 PSK TLS profile; arbitrary overrides can trigger anti-bot checks. | `--user-agent "Mozilla/5.0 ... Chrome/146.0.0.0 Safari/537.36"` | Chrome 146 |
@@ -61,7 +61,7 @@ Extract the archive before running the binary. Each release includes `checksums.
 | download-threads | Number of concurrent download workers for assets and external links. | `--download-threads 4` | `1` |
 | timeout | HTTP timeout for downloads and API requests (e.g., 30s, 5m). | `--timeout 60s` | `2m` |
 | use-state-manager | Use state manager to track downloaded posts (creates LastSavePostId.json). | `--use-state-manager` | `false` |
-| check | Check downloaded content and repair missing images, files, text, JSON and HTML. Waits for repair work before exiting. | `--check` | `false` |
+| check | Detect missing or zero-byte images, files, text, JSON and HTML, then repair them. Waits for repair work and returns an error if repairs fail. | `--check` | `false` |
 
 ### Example
 
@@ -178,7 +178,7 @@ This creates and uses:
 
 #### Checking Download Completeness
 
-Verify downloaded content and repair missing files without re-downloading existing files:
+Verify downloaded content and repair missing or zero-byte files without re-downloading healthy files. A downloaded file is complete only when it is a nonempty regular file with no pending `.state` or `.part` data.
 
 ```bash
 fanbox-dl --cookie "YOUR_COOKIE" --check
@@ -186,14 +186,25 @@ fanbox-dl --cookie "YOUR_COOKIE" --check
 
 The check mode will:
 - Scan all posts from your creators
-- Verify that all expected files exist:
+- Verify that all expected files exist and contain at least one byte:
   - Images and files from posts
   - Text content (if `--skip-texts` was not used)
   - JSON files (if `--save-json` was enabled)
   - HTML files (if `--save-html` was enabled)
-- Report any missing files with detailed information
+- Report missing and zero-byte files as incomplete, including older files that have no state metadata
 - Display a summary of complete vs incomplete posts
-- Repair missing content with the configured worker limit and wait for active downloads before exiting
+- Repair incomplete content with the configured worker limit, wait for active downloads, and return an error if any repair fails
+- Recheck enabled Gigafile/Google Drive downloads even when the saved HTML is already present
+
+To report problems without modifying files:
+
+```bash
+fanbox-dl --check --dry-run --save-dir ./downloads
+```
+
+Use the same `--save-dir`, `--dir-by-post`, `--dir-by-plan`, export and external-download options used for the original download. `--check` scans posts without relying on the last-post checkpoint. Its summary counts incomplete outputs discovered during the scan; successful repairs are logged before exit. With `--dry-run`, external downloaders are not invoked.
+
+Downloads without `Content-Length` are streamed until EOF instead of being saved as empty files. Empty responses, mismatched advertised sizes and invalid resume ranges fail without promoting a partial file or replacing an existing valid final file. Empty attachments are not considered successful downloads.
 
 **Example output:**
 ```
@@ -332,6 +343,14 @@ This is useful for:
 - Checking if any files are missing
 - Auditing download completeness
 
+
+### Changes in v0.30.2
+
+- Fixes zero-byte downloads caused by HEAD responses with absent or unknown file sizes; ordinary downloads and `--check` now share one streaming/resume path.
+- Rejects empty or truncated transfers before final-file replacement and preserves incomplete state for recovery.
+- Detects and repairs zero-byte media and enabled text/JSON/HTML exports, including files left by older versions.
+- Adds read-only `--check --dry-run`, propagates repair errors and checks enabled external downloads even when HTML is already saved.
+- Fixes mixed image/file numbering during checks and validates final sizes and Content-Range for resumed FANBOX, Gigafile and Google Drive downloads.
 
 ### Changes in v0.30.1
 

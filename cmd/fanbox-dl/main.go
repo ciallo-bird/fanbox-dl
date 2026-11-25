@@ -117,7 +117,7 @@ var skipTexts = &cli.BoolFlag{
 var dryRunFlag = &cli.BoolFlag{
 	Name:  "dry-run",
 	Value: false,
-	Usage: "Whether to dry-run. In dry-run, fanbox-dl skip downloading files.",
+	Usage: "Skip downloading and writing files. With --check, only report missing or zero-byte files.",
 }
 var verboseFlag = &cli.BoolFlag{
 	Name:  "verbose",
@@ -204,7 +204,7 @@ var endDateFlag = &cli.StringFlag{
 var checkFlag = &cli.BoolFlag{
 	Name:  "check",
 	Value: false,
-	Usage: "Check downloaded content for completeness and automatically download missing files.",
+	Usage: "Check for missing or zero-byte files and repair them; combine with --dry-run to only report.",
 }
 
 func newHTTPClient(c *cli.Context) (*retryablehttp.Client, error) {
@@ -506,7 +506,7 @@ func runCheckMode(c *cli.Context) error {
 		SkipTexts:          c.Bool(skipTexts.Name),
 		EnableSaveJSON:     c.Bool(saveJSONFlag.Name),
 		EnableSaveHTML:     c.Bool(saveHTMLFlag.Name),
-		DownloadOnMissing:  true, // Enable automatic download of missing files
+		DownloadOnMissing:  !c.Bool(dryRunFlag.Name),
 		DownloadWorkers:    c.Int(downloadThreadsFlag.Name),
 		HTMLGenerator:      htmlGenerator,
 		GigafileDownloader: gigafileDownloader,

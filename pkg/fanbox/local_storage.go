@@ -54,19 +54,7 @@ func (s *LocalStorage) Save(post Post, order int, d Downloadable, r io.Reader) e
 }
 
 func (s *LocalStorage) Exist(post Post, order int, d Downloadable) (bool, error) {
-	name := s.makeFileName(post, order, d)
-	if hasIncompleteState(name) {
-		return false, nil
-	}
-	_, err := os.Stat(name)
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("stat file: %w", err)
-	}
-
-	return true, nil
+	return isDownloadComplete(s.makeFileName(post, order, d))
 }
 
 // SaveText saves the text content of a post to a text file
@@ -86,7 +74,7 @@ func (s *LocalStorage) SaveText(post Post) error {
 		}
 	}
 
-	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE, 0775)
+	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0775)
 	if err != nil {
 		return fmt.Errorf("open file to save text: %w", err)
 	}
@@ -104,15 +92,7 @@ func (s *LocalStorage) SaveText(post Post) error {
 
 // TextExists checks if the text file already exists
 func (s *LocalStorage) TextExists(post Post) (bool, error) {
-	_, err := os.Stat(s.makeTextFileName(post))
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("stat file: %w", err)
-	}
-
-	return true, nil
+	return isDownloadComplete(s.makeTextFileName(post))
 }
 
 // JSONExists checks if the JSON file already exists
@@ -121,15 +101,7 @@ func (s *LocalStorage) JSONExists(post Post) (bool, error) {
 		return false, nil
 	}
 
-	_, err := os.Stat(s.makeJSONFileName(post))
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("stat file: %w", err)
-	}
-
-	return true, nil
+	return isDownloadComplete(s.makeJSONFileName(post))
 }
 
 // limitOsSafely limits the string length for OS safely.
@@ -384,6 +356,9 @@ func (s *LocalStorage) SaveJSON(post Post, jsonData []byte) error {
 	if !s.EnableSaveJSON {
 		return nil
 	}
+	if len(jsonData) == 0 {
+		return fmt.Errorf("cannot save empty JSON")
+	}
 
 	name := s.makeJSONFileName(post)
 	if name == "" {
@@ -407,15 +382,7 @@ func (s *LocalStorage) HTMLExists(post Post) (bool, error) {
 		return false, nil
 	}
 
-	_, err := os.Stat(s.makeHTMLFileName(post))
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("stat file: %w", err)
-	}
-
-	return true, nil
+	return isDownloadComplete(s.makeHTMLFileName(post))
 }
 
 // MakeFileName generates the filename for a downloadable asset
@@ -476,6 +443,9 @@ func (s *LocalStorage) makeHTMLFileName(post Post) string {
 func (s *LocalStorage) SaveHTML(post Post, htmlContent string) error {
 	if !s.EnableSaveHTML {
 		return nil
+	}
+	if htmlContent == "" {
+		return fmt.Errorf("cannot save empty HTML")
 	}
 
 	name := s.makeHTMLFileName(post)

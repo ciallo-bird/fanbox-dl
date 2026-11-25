@@ -131,6 +131,10 @@ func (g *GigafileDownloader) DownloadFile(ctx context.Context, gigafileURL strin
 	} else if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download failed with status %d", resp.StatusCode)
 	}
+	totalBytes, err := downloadResponseSize(resp, rangeStart)
+	if err != nil {
+		return err
+	}
 
 	// Save the file
 	meta.URL = gigafileURL
@@ -143,10 +147,10 @@ func (g *GigafileDownloader) DownloadFile(ctx context.Context, gigafileURL strin
 	}
 
 	if hasTemp && rangeStart > 0 {
-		if err := saveReaderWithStateAt(ctx, savePath, resp.Body, meta, resp.ContentLength, 0666, rangeStart, true); err != nil {
+		if err := saveReaderWithStateAt(ctx, savePath, resp.Body, meta, totalBytes, 0666, rangeStart, true); err != nil {
 			return fmt.Errorf("save file: %w", err)
 		}
-	} else if err := saveReaderWithState(ctx, savePath, resp.Body, meta, resp.ContentLength, 0666); err != nil {
+	} else if err := saveReaderWithState(ctx, savePath, resp.Body, meta, totalBytes, 0666); err != nil {
 		return fmt.Errorf("save file: %w", err)
 	}
 

@@ -168,5 +168,5 @@ func TestRobustDownloaderDoesNotRetryRejectedSession(t *testing.T) {
 	})
 	err := NewRobustDownloader(api).DownloadWithResume(context.Background(), "https://downloads.fanbox.cc/file", t.TempDir()+"/file", DownloadStateMeta{})
 	require.True(t, errors.Is(err, ErrStatusForbidden))
-	require.Equal(t, 1, calls, "HEAD failure must not trigger another GET")
+	require.Equal(t, 1, calls, "a rejected session must not trigger more download requests")
 }

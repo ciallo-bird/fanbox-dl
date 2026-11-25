@@ -135,12 +135,8 @@ func (g *DriveDownloader) DownloadFile(ctx context.Context, driveURL string, sav
 			rangeStart := resumeOffset
 			filename, body, totalBytes, acceptsRange, lastDownloadErr = g.downloadWithConfirmation(ctx, downloadURL, driveURL, rangeStart)
 			if lastDownloadErr == nil && rangeStart > 0 && !acceptsRange {
-				if resumePath != "" {
-					_ = os.Remove(tempFilePath(resumePath))
-				}
+				// HTTP 200 is already a full response; reuse it rather than requesting it again.
 				resumeOffset = 0
-				rangeStart = 0
-				filename, body, totalBytes, acceptsRange, lastDownloadErr = g.downloadWithConfirmation(ctx, downloadURL, driveURL, rangeStart)
 			}
 			if lastDownloadErr == nil {
 				lastErr = nil
@@ -163,7 +159,6 @@ func (g *DriveDownloader) DownloadFile(ctx context.Context, driveURL string, sav
 				if err != nil {
 					lastErr = fmt.Errorf("check file: %w", err)
 				} else if complete {
-					_, _ = io.Copy(io.Discard, body)
 					_ = body.Close()
 					slog.Info("Google Drive file already downloaded", "filename", filename, "url", driveURL)
 					return nil
@@ -174,18 +169,24 @@ func (g *DriveDownloader) DownloadFile(ctx context.Context, driveURL string, sav
 						if err := saveReaderWithStateAt(ctx, savePath, body, meta, totalBytes, 0666, resumeOffset, true); err != nil {
 							lastErr = fmt.Errorf("save file: %w", err)
 						} else {
+							_ = body.Close()
 							slog.Info("Downloaded Google Drive file", "filename", filepath.Base(savePath), "url", driveURL)
 							return nil
 						}
 					} else if err := saveReaderWithState(ctx, savePath, body, meta, totalBytes, 0666); err != nil {
 						lastErr = fmt.Errorf("save file: %w", err)
 					} else {
+						_ = body.Close()
 						slog.Info("Downloaded Google Drive file", "filename", filepath.Base(savePath), "url", driveURL)
 						return nil
 					}
 				}
 				if body != nil {
 					_ = body.Close()
+				}
+				resumePath = savePath
+				if size, hasTemp, err := tempFileOffset(savePath); err == nil && hasTemp {
+					resumeOffset = size
 				}
 			}
 
@@ -296,6 +297,11 @@ func (g *DriveDownloader) downloadOnce(ctx context.Context, urlStr string, cooki
 		}
 		return "", nil, nil, "", "", false, 0, false, fmt.Errorf("download failed with status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
+	totalBytes, err := downloadResponseSize(resp, rangeStart)
+	if err != nil {
+		_ = resp.Body.Close()
+		return "", nil, nil, "", "", false, 0, false, err
+	}
 
 	respCookies := resp.Cookies()
 
@@ -304,7 +310,7 @@ func (g *DriveDownloader) downloadOnce(ctx context.Context, urlStr string, cooki
 	filename := ""
 	if contentDisposition != "" {
 		filename = g.parseFilename(contentDisposition)
-		return filename, resp.Body, respCookies, "", "", false, resp.ContentLength, acceptsRange, nil
+		return filename, resp.Body, respCookies, "", "", false, totalBytes, acceptsRange, nil
 	}
 
 	contentType := resp.Header.Get("Content-Type")
@@ -351,7 +357,11 @@ func (g *DriveDownloader) downloadOnce(ctx context.Context, urlStr string, cooki
 		return "", nil, respCookies, "", "", false, 0, false, fmt.Errorf("unexpected HTML response from Google Drive")
 	}
 
-	return filename, io.NopCloser(io.MultiReader(bytes.NewReader(peek), resp.Body)), respCookies, "", "", false, resp.ContentLength, acceptsRange, nil
+	body := struct {
+		io.Reader
+		io.Closer
+	}{Reader: io.MultiReader(bytes.NewReader(peek), resp.Body), Closer: resp.Body}
+	return filename, body, respCookies, "", "", false, totalBytes, acceptsRange, nil
 }
 
 func (g *DriveDownloader) looksLikeHTML(contentType string, peek []byte) bool {

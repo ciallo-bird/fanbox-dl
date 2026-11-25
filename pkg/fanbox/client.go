@@ -625,90 +625,29 @@ func (c *Client) downloadWithRetry(ctx context.Context, post Post, order int, d 
 var ErrStatusForbidden = errors.New("status code 403")
 
 func (c *Client) download(ctx context.Context, post Post, order int, d Downloadable) error {
-	var resp *http.Response
+	assetType := "image"
+	if _, ok := d.(File); ok {
+		assetType = "file"
+	}
+	meta := DownloadStateMeta{
+		CreatorID: post.CreatorID, PostID: post.ID, PostTitle: post.Title,
+		AssetID: d.GetID(), AssetType: assetType, URL: d.GetURL(),
+	}
 	filePath := c.Storage.makeFileName(post, order, d)
-	rangeStart, hasTemp, err := tempFileOffset(filePath)
-	if err != nil {
-		return fmt.Errorf("check temp file: %w", err)
+	downloader := NewRobustDownloader(c.OfficialAPIClient)
+	err := downloader.DownloadWithResume(ctx, d.GetURL(), filePath, meta)
+	if !errors.Is(err, ErrFailedToThumbnailing) {
+		return err
 	}
-	if rangeStart < 0 {
-		rangeStart = 0
+	thumbnailURL, ok := d.GetThumbnailURL()
+	if !ok {
+		return fmt.Errorf("thumbnail URL is not found")
 	}
-
-	headers := map[string]string{}
-	if hasTemp && rangeStart > 0 {
-		headers["Range"] = fmt.Sprintf("bytes=%d-", rangeStart)
+	// A thumbnail is different content; an original-image prefix cannot be resumed.
+	if err := os.Remove(tempFilePath(filePath)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove original partial file: %w", err)
 	}
-	resp, err = c.OfficialAPIClient.RequestWithHeaders(ctx, http.MethodGet, d.GetURL(), headers)
-	if err != nil {
-		if errors.Is(err, ErrFailedToThumbnailing) {
-			slog.InfoContext(ctx, "The original file is not available (maybe it's a too large), so download a thumbnail instead", "original_file", d.GetURL())
-			tu, ok := d.GetThumbnailURL()
-			if !ok {
-				return fmt.Errorf("thumbnail URL is not found")
-			}
-			slog.InfoContext(ctx, "Downloading a thumbnail", "thumbnail_url", tu)
-
-			resp, err = c.OfficialAPIClient.Request(ctx, http.MethodGet, tu)
-			if err != nil {
-				return fmt.Errorf("request error (%s): %w", tu, err)
-			}
-			rangeStart = 0
-			hasTemp = false
-		} else {
-			return fmt.Errorf("request error (%s): %w", d.GetURL(), err)
-		}
-	}
-
-	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}()
-
-	if resp.StatusCode == http.StatusPartialContent {
-		if !hasTemp || rangeStart == 0 {
-			return fmt.Errorf("unexpected partial content response")
-		}
-	} else if resp.StatusCode != 200 {
-		if resp.StatusCode == 403 {
-			return ErrStatusForbidden
-		}
-		return fmt.Errorf("status code %d", resp.StatusCode)
-	}
-
-	if resp.StatusCode == http.StatusOK && hasTemp && rangeStart > 0 {
-		if err := os.Remove(tempFilePath(filePath)); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove temp file: %w", err)
-		}
-		rangeStart = 0
-		hasTemp = false
-	}
-
-	if hasTemp && rangeStart > 0 {
-		assetType := "unknown"
-		switch d.(type) {
-		case Image:
-			assetType = "image"
-		case File:
-			assetType = "file"
-		}
-		meta := DownloadStateMeta{
-			CreatorID: post.CreatorID,
-			PostID:    post.ID,
-			PostTitle: post.Title,
-			AssetID:   d.GetID(),
-			AssetType: assetType,
-			URL:       d.GetURL(),
-		}
-		if err := saveReaderWithStateAt(ctx, filePath, resp.Body, meta, resp.ContentLength, 0775, rangeStart, true); err != nil {
-			return fmt.Errorf("save a file: %w", err)
-		}
-		return nil
-	}
-
-	if err := c.Storage.Save(post, order, d, resp.Body); err != nil {
-		return fmt.Errorf("save a file: %w", err)
-	}
-
-	return nil
+	slog.InfoContext(ctx, "Original image unavailable; downloading a thumbnail", "thumbnail_url", thumbnailURL)
+	meta.URL = thumbnailURL
+	return downloader.DownloadWithResume(ctx, thumbnailURL, filePath, meta)
 }

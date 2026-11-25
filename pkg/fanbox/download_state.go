@@ -19,19 +19,19 @@ const (
 )
 
 type DownloadState struct {
-	Version     int    `json:"version"`
-	Status      string `json:"status"`
-	CreatorID   string `json:"creatorId,omitempty"`
-	PostID      string `json:"postId,omitempty"`
-	PostTitle   string `json:"postTitle,omitempty"`
-	AssetID     string `json:"assetId,omitempty"`
-	AssetType   string `json:"assetType,omitempty"`
-	URL         string `json:"url,omitempty"`
-	FilePath    string `json:"filePath"`
-	Bytes       int64  `json:"bytes"`
-	TotalBytes  int64  `json:"totalBytes,omitempty"`
-	UpdatedAt   string `json:"updatedAt"`
-	LastError   string `json:"lastError,omitempty"`
+	Version    int    `json:"version"`
+	Status     string `json:"status"`
+	CreatorID  string `json:"creatorId,omitempty"`
+	PostID     string `json:"postId,omitempty"`
+	PostTitle  string `json:"postTitle,omitempty"`
+	AssetID    string `json:"assetId,omitempty"`
+	AssetType  string `json:"assetType,omitempty"`
+	URL        string `json:"url,omitempty"`
+	FilePath   string `json:"filePath"`
+	Bytes      int64  `json:"bytes"`
+	TotalBytes int64  `json:"totalBytes,omitempty"`
+	UpdatedAt  string `json:"updatedAt"`
+	LastError  string `json:"lastError,omitempty"`
 }
 
 type DownloadStateMeta struct {
@@ -138,106 +138,116 @@ func isDownloadComplete(path string) (bool, error) {
 	if hasIncompleteState(path) {
 		return false, nil
 	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
 		return false, nil
-	} else if err != nil {
+	}
+	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return info.Mode().IsRegular() && info.Size() > 0, nil
 }
 
 func saveReaderWithState(ctx context.Context, path string, r io.Reader, meta DownloadStateMeta, totalBytes int64, fileMode os.FileMode) error {
 	return saveReaderWithStateAt(ctx, path, r, meta, totalBytes, fileMode, 0, false)
 }
 
+// totalBytes is the expected final file size, including an appended prefix.
+// Nonpositive sizes are unknown; an empty response is never a complete download.
 func saveReaderWithStateAt(ctx context.Context, path string, r io.Reader, meta DownloadStateMeta, totalBytes int64, fileMode os.FileMode, startOffset int64, appendMode bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if startOffset < 0 || (!appendMode && startOffset != 0) {
+		return fmt.Errorf("invalid download offset: %d", startOffset)
+	}
 	if fileMode == 0 {
 		fileMode = 0664
 	}
-
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create directory (%s): %w", dir, err)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("create download directory: %w", err)
 	}
-
 	statePath := stateFilePath(path)
 	tempPath := tempFilePath(path)
-	if !appendMode {
-		_ = os.Remove(tempPath)
-	}
-
 	state := DownloadState{
-		Version:    1,
-		Status:     downloadStateStatusDownloading,
-		CreatorID:  meta.CreatorID,
-		PostID:     meta.PostID,
-		PostTitle:  meta.PostTitle,
-		AssetID:    meta.AssetID,
-		AssetType:  meta.AssetType,
-		URL:        meta.URL,
-		FilePath:   path,
-		Bytes:      startOffset,
-		UpdatedAt:  time.Now().Format(time.RFC3339Nano),
+		Version:   1,
+		Status:    downloadStateStatusDownloading,
+		CreatorID: meta.CreatorID,
+		PostID:    meta.PostID,
+		PostTitle: meta.PostTitle,
+		AssetID:   meta.AssetID,
+		AssetType: meta.AssetType,
+		URL:       meta.URL,
+		FilePath:  path,
+		Bytes:     startOffset,
+		UpdatedAt: time.Now().Format(time.RFC3339Nano),
 	}
 	if totalBytes > 0 {
 		state.TotalBytes = totalBytes
 	}
-
 	if err := writeStateFile(statePath, state); err != nil {
 		return fmt.Errorf("write state file: %w", err)
 	}
-
-	flags := os.O_WRONLY | os.O_CREATE
-	if appendMode {
-		flags |= os.O_APPEND
-	} else {
-		flags |= os.O_TRUNC
-	}
-	file, err := os.OpenFile(tempPath, flags, fileMode)
-	if err != nil {
+	written := startOffset
+	fail := func(err error) error {
 		state.Status = downloadStateStatusFailed
 		state.LastError = err.Error()
+		state.Bytes = written
 		state.UpdatedAt = time.Now().Format(time.RFC3339Nano)
 		_ = writeStateFile(statePath, state)
-		return fmt.Errorf("open temp file: %w", err)
+		return err
 	}
+	var file *os.File
 	defer func() {
-		_ = file.Close()
+		if file != nil {
+			_ = file.Close()
+		}
 	}()
-
 	buf := make([]byte, 32*1024)
-	written := startOffset
 	lastUpdate := time.Now()
 	lastBytes := startOffset
-	lastProgressLog := time.Now()
-
-	// Extract filename from path for progress logging
+	lastProgressLog := lastUpdate
 	filename := filepath.Base(path)
-
 	for {
-		if ctx.Err() != nil {
-			state.Status = downloadStateStatusFailed
-			state.LastError = ctx.Err().Error()
-			state.Bytes = written
-			state.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-			_ = writeStateFile(statePath, state)
-			return ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return fail(err)
 		}
-
 		n, readErr := r.Read(buf)
 		if n > 0 {
-			if _, err := file.Write(buf[:n]); err != nil {
-				state.Status = downloadStateStatusFailed
-				state.LastError = err.Error()
-				state.Bytes = written
-				state.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-				_ = writeStateFile(statePath, state)
-				return fmt.Errorf("write file: %w", err)
+			if totalBytes > 0 && (written > totalBytes || int64(n) > totalBytes-written) {
+				return fail(fmt.Errorf("download exceeds expected size of %d bytes", totalBytes))
 			}
-			written += int64(n)
+			// Do not truncate an existing partial file until new data actually arrives.
+			if file == nil {
+				flags := os.O_WRONLY
+				if appendMode {
+					flags |= os.O_APPEND
+				} else {
+					flags |= os.O_CREATE | os.O_TRUNC
+				}
+				var err error
+				file, err = os.OpenFile(tempPath, flags, fileMode)
+				if err != nil {
+					return fail(fmt.Errorf("open temp file: %w", err))
+				}
+				if appendMode {
+					info, err := file.Stat()
+					if err != nil {
+						return fail(fmt.Errorf("stat partial file: %w", err))
+					}
+					if !info.Mode().IsRegular() || info.Size() != startOffset {
+						return fail(fmt.Errorf("partial file size does not match resume offset %d", startOffset))
+					}
+				}
+			}
+			nw, err := file.Write(buf[:n])
+			written += int64(nw)
+			if err != nil {
+				return fail(fmt.Errorf("write file: %w", err))
+			}
+			if nw != n {
+				return fail(io.ErrShortWrite)
+			}
 			now := time.Now()
 			if now.Sub(lastUpdate) >= time.Second || written-lastBytes >= 1<<20 {
 				state.Bytes = written
@@ -245,8 +255,6 @@ func saveReaderWithStateAt(ctx context.Context, path string, r io.Reader, meta D
 				_ = writeStateFile(statePath, state)
 				lastUpdate = now
 				lastBytes = written
-
-				// Log progress every 2 seconds
 				if now.Sub(lastProgressLog) >= 2*time.Second {
 					logProgress(filename, written, totalBytes)
 					lastProgressLog = now
@@ -257,56 +265,36 @@ func saveReaderWithStateAt(ctx context.Context, path string, r io.Reader, meta D
 			if readErr == io.EOF {
 				break
 			}
-			state.Status = downloadStateStatusFailed
-			state.LastError = readErr.Error()
-			state.Bytes = written
-			state.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-			_ = writeStateFile(statePath, state)
-			return fmt.Errorf("read stream: %w", readErr)
+			return fail(fmt.Errorf("read stream: %w", readErr))
 		}
 	}
-
-	// Final progress log
-	logProgress(filename, written, totalBytes)
-
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	if written == startOffset {
+		return fail(fmt.Errorf("empty download response"))
+	}
+	if totalBytes > 0 && written != totalBytes {
+		return fail(fmt.Errorf("download has %d bytes, expected %d: %w", written, totalBytes, io.ErrUnexpectedEOF))
+	}
 	if err := file.Sync(); err != nil {
-		state.Status = downloadStateStatusFailed
-		state.LastError = err.Error()
-		state.Bytes = written
-		state.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-		_ = writeStateFile(statePath, state)
-		return fmt.Errorf("sync file: %w", err)
+		return fail(fmt.Errorf("sync file: %w", err))
 	}
 	if err := file.Close(); err != nil {
-		state.Status = downloadStateStatusFailed
-		state.LastError = err.Error()
-		state.Bytes = written
-		state.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-		_ = writeStateFile(statePath, state)
-		return fmt.Errorf("close file: %w", err)
+		file = nil
+		return fail(fmt.Errorf("close file: %w", err))
 	}
-
+	file = nil
+	// Rename replaces files on supported platforms; never delete a target on failure.
 	if err := os.Rename(tempPath, path); err != nil {
-		if removeErr := os.Remove(path); removeErr == nil {
-			if retryErr := os.Rename(tempPath, path); retryErr == nil {
-				goto renamed
-			}
-		}
-		state.Status = downloadStateStatusFailed
-		state.LastError = err.Error()
-		state.Bytes = written
-		state.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-		_ = writeStateFile(statePath, state)
-		return fmt.Errorf("rename file: %w", err)
+		return fail(fmt.Errorf("rename file: %w", err))
 	}
-renamed:
-
 	state.Status = downloadStateStatusCompleted
 	state.Bytes = written
 	state.UpdatedAt = time.Now().Format(time.RFC3339Nano)
 	_ = writeStateFile(statePath, state)
 	_ = os.Remove(statePath)
-
+	logProgress(filename, written, totalBytes)
 	return nil
 }
 

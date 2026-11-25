@@ -38,6 +38,7 @@ func TestClientResumesAfterTLSClientGoAway(t *testing.T) {
 		require.Equal(t, "bytes=3-", req.Header.Get("Range"))
 		resp := sessionResponse(req, 206, "def")
 		resp.ContentLength = 3
+		resp.Header.Set("Content-Range", "bytes 3-5/6")
 		return resp, nil
 	})
 	post := crawlPost("30", "2026-06-20T00:00:00Z")

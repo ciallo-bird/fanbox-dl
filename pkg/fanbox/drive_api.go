@@ -119,6 +119,9 @@ func (d *DriveAPIDownloader) DownloadFile(ctx context.Context, fileID string, sa
 	req := d.service.Files.Get(fileID).
 		Context(ctx).
 		SupportsAllDrives(true)
+	if resumeOffset > 0 {
+		req.Header().Set("Range", fmt.Sprintf("bytes=%d-", resumeOffset))
+	}
 
 	resp, err := req.Download()
 	if err != nil {
@@ -134,6 +137,16 @@ func (d *DriveAPIDownloader) DownloadFile(ctx context.Context, fileID string, sa
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("download failed with status %d: %s", resp.StatusCode, string(body))
 	}
+	totalBytes, err := downloadResponseSize(resp, resumeOffset)
+	if err != nil {
+		return err
+	}
+	if file.Size > 0 {
+		if totalBytes > 0 && totalBytes != file.Size {
+			return fmt.Errorf("download size %d does not match Drive metadata size %d", totalBytes, file.Size)
+		}
+		totalBytes = file.Size
+	}
 
 	// Update metadata
 	if meta.AssetType == "" {
@@ -145,11 +158,11 @@ func (d *DriveAPIDownloader) DownloadFile(ctx context.Context, fileID string, sa
 
 	// Save file with progress tracking and resume support
 	if resumeOffset > 0 && resp.StatusCode == http.StatusPartialContent {
-		if err := saveReaderWithStateAt(ctx, savePath, resp.Body, meta, file.Size, 0666, resumeOffset, true); err != nil {
+		if err := saveReaderWithStateAt(ctx, savePath, resp.Body, meta, totalBytes, 0666, resumeOffset, true); err != nil {
 			return fmt.Errorf("save file: %w", err)
 		}
 	} else {
-		if err := saveReaderWithState(ctx, savePath, resp.Body, meta, file.Size, 0666); err != nil {
+		if err := saveReaderWithState(ctx, savePath, resp.Body, meta, totalBytes, 0666); err != nil {
 			return fmt.Errorf("save file: %w", err)
 		}
 	}
